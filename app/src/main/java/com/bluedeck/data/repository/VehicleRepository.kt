@@ -1,0 +1,4197 @@
+package com.bluedeck.data.repository
+
+import com.bluedeck.data.api.ApiClient
+import com.bluedeck.data.api.AuApiClient
+import com.bluedeck.data.api.CanadaApiClient
+import com.bluedeck.data.api.canadaUnreadableBodyMessage
+import com.bluedeck.data.api.EuApiClient
+import com.bluedeck.data.api.parseCanadaJsonBody
+import com.bluedeck.data.api.readCanadaHttpBody
+import com.bluedeck.data.api.EuIdentityApiClient
+import com.bluedeck.data.api.KiaUsApiClient
+import com.bluedeck.data.api.Region
+import com.bluedeck.data.auth.CanadaMfaResponses
+import com.bluedeck.data.auth.KiaUsOtpResponses
+import com.bluedeck.data.auth.OtpChallengeUi
+import com.bluedeck.data.auth.OtpDeliveryMethod
+import com.bluedeck.data.auth.OtpRequiredException
+import com.bluedeck.data.auth.OTP_REQUIRED_CODE
+import com.bluedeck.data.auth.PendingOtpChallenge
+import com.bluedeck.data.demo.DemoVehicleStore
+import com.bluedeck.data.models.*
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import javax.inject.Inject
+import com.google.gson.Gson
+import com.google.gson.JsonArray
+import com.google.gson.JsonElement
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
+import okhttp3.ResponseBody
+import java.io.IOException
+import java.security.SecureRandom
+import kotlin.math.roundToInt
+
+import javax.inject.Singleton
+
+sealed class Result<out T> {
+    data class Success<T>(val data: T) : Result<T>()
+    data class Error(val message: String, val code: Int? = null) : Result<Nothing>()
+}
+
+@Singleton
+class VehicleRepository @Inject constructor(
+    private val preferencesManager: PreferencesManager,
+    private val secureCredentialsManager: SecureCredentialsManager,
+    private val demoVehicleStore: DemoVehicleStore
+) {
+    private var apiClient: ApiClient? = null
+    private var apiClientRegion: Region? = null
+    private var canadaApiClient: CanadaApiClient? = null
+    private var canadaApiClientRegion: Region? = null
+    private var euApiClient: EuApiClient? = null
+    private var euApiClientRegion: Region? = null
+    private var euApiClientDeviceId: String? = null
+    private var euIdentityApiClient: EuIdentityApiClient? = null
+    private var euIdentityApiClientRegion: Region? = null
+    private var auApiClient: AuApiClient? = null
+    private var auApiClientRegion: Region? = null
+    private var auApiClientDeviceId: String? = null
+    private var kiaUsApiClient: KiaUsApiClient? = null
+    private var kiaUsApiClientDeviceId: String? = null
+    private var pendingOtpChallenge: PendingOtpChallenge? = null
+    private var pendingOtpMessage: String? = null
+    private val gson = Gson()
+    private val seatConfigurationsByVin = mutableMapOf<String, SeatConfigurations>()
+    /** Cached after a successful CA EV climate start: true = remoteControl, false = hvacInfo. */
+    private val canadaEvUsesRemoteControl = mutableMapOf<String, Boolean>()
+    private val canadaCommandCooldownUntilMs = mutableMapOf<String, Long>()
+
+    private companion object {
+        const val CANADA_COMMAND_COOLDOWN_MS = 90_000L
+        /** Shared across Hilt singleton and ad-hoc widget/alarm instances. */
+        private val tokenRefreshMutex = Mutex()
+    }
+
+    private fun rememberCanadaCommandCooldown(vehicleId: String) {
+        canadaCommandCooldownUntilMs[vehicleId] = System.currentTimeMillis() + CANADA_COMMAND_COOLDOWN_MS
+    }
+
+    private fun canadaCooldownRemainingMs(vehicleId: String): Long {
+        val until = canadaCommandCooldownUntilMs[vehicleId] ?: return 0L
+        return (until - System.currentTimeMillis()).coerceAtLeast(0L)
+    }
+
+    private fun canadaCooldownMessage(remainingMs: Long): String {
+        val seconds = ((remainingMs + 999) / 1000).toInt().coerceAtLeast(1)
+        return "BlueLink is still processing the previous request. Please wait about $seconds seconds, then try again."
+    }
+
+    private suspend fun currentRegion(): Region {
+        val regionStr = preferencesManager.region.first()
+        return runCatching { Region.valueOf(regionStr) }.getOrDefault(Region.US_HYUNDAI)
+    }
+
+    private suspend fun getApiService() = run {
+        val region = currentRegion()
+        if (region.isCanada) {
+            throw IllegalStateException("Canada uses the TODS web API path. Use the Canada API service instead.")
+        }
+        if (region == Region.US_KIA) {
+            throw IllegalStateException("USA Kia uses the Kia Owners API path. Use the Kia USA API service instead.")
+        }
+        if (apiClient == null || apiClientRegion != region) {
+            apiClient = ApiClient(region.baseUrl)
+            apiClientRegion = region
+        }
+        apiClient!!.apiService
+    }
+
+    private suspend fun getCanadaApiService() = run {
+        val region = currentRegion()
+        if (!region.isCanada) {
+            throw IllegalStateException("Current region is not Canada")
+        }
+        if (canadaApiClient == null || canadaApiClientRegion != region) {
+            canadaApiClient = CanadaApiClient(region.baseUrl, region.canadaHost)
+            canadaApiClientRegion = region
+        }
+        canadaApiClient!!.apiService
+    }
+
+    private suspend fun getEuApiService() = run {
+        val region = currentRegion()
+        if (!region.isEurope) {
+            throw IllegalStateException("Current region is not Europe")
+        }
+        val deviceId = ensureEuropeDeviceRegistered(region)
+        if (euApiClient == null || euApiClientRegion != region || euApiClientDeviceId != deviceId) {
+            euApiClient = EuApiClient(region, deviceId)
+            euApiClientRegion = region
+            euApiClientDeviceId = deviceId
+        }
+        euApiClient!!.apiService
+    }
+
+    private suspend fun getEuIdentityApiService() = run {
+        val region = currentRegion()
+        if (!region.isEurope) {
+            throw IllegalStateException("Current region is not Europe")
+        }
+        if (euIdentityApiClient == null || euIdentityApiClientRegion != region) {
+            euIdentityApiClient = EuIdentityApiClient(region)
+            euIdentityApiClientRegion = region
+        }
+        euIdentityApiClient!!.apiService
+    }
+
+    private suspend fun getAuApiService() = run {
+        val region = currentRegion()
+        if (!region.isAustralia) {
+            throw IllegalStateException("Current region is not Australia/New Zealand")
+        }
+        val deviceId = preferencesManager.getOrCreateAuDeviceId()
+        if (auApiClient == null || auApiClientRegion != region || auApiClientDeviceId != deviceId) {
+            auApiClient = AuApiClient(region, deviceId)
+            auApiClientRegion = region
+            auApiClientDeviceId = deviceId
+        }
+        auApiClient!!.apiService
+    }
+
+    private suspend fun getKiaUsApiService() = run {
+        if (currentRegion() != Region.US_KIA) {
+            throw IllegalStateException("Current region is not USA Kia")
+        }
+        val deviceId = preferencesManager.getOrCreateKiaUsDeviceId()
+        if (kiaUsApiClient == null || kiaUsApiClientDeviceId != deviceId) {
+            kiaUsApiClient = KiaUsApiClient(deviceId)
+            kiaUsApiClientDeviceId = deviceId
+        }
+        kiaUsApiClient!!.apiService
+    }
+
+    private suspend fun kiaUsDeviceId(): String = preferencesManager.getOrCreateKiaUsDeviceId()
+
+    private suspend fun isKiaUsRegion(): Boolean = currentRegion() == Region.US_KIA
+    private suspend fun isCanadaRegion(): Boolean = currentRegion().isCanada
+    private suspend fun isEuropeRegion(): Boolean = currentRegion().isEurope
+    private suspend fun isAustraliaRegion(): Boolean = currentRegion().isAustralia
+
+    private suspend fun getToken(): String = ensureValidAccessToken()
+
+    private suspend fun getUsername() = preferencesManager.username.first()
+        ?: throw IllegalStateException("Not authenticated")
+
+    private suspend fun getServicePin(required: Boolean = true): String {
+        val pin = preferencesManager.effectiveServicePin()
+        if (required && pin.isBlank()) {
+            throw IllegalStateException("Bluelink PIN is required.")
+        }
+        return pin
+    }
+
+    private suspend fun bearerToken(): String = "Bearer ${getToken()}"
+
+    private suspend fun ensureValidAccessToken(): String = tokenRefreshMutex.withLock {
+        val accessToken = preferencesManager.accessToken.first().orEmpty()
+        val refreshToken = preferencesManager.refreshToken.first().orEmpty()
+        if (accessToken.isBlank() && refreshToken.isBlank()) {
+            throw IllegalStateException("Not authenticated")
+        }
+
+        val expiresAt = preferencesManager.tokenExpiresAt.first()
+        if (accessToken.isNotBlank() && expiresAt > System.currentTimeMillis() + 60_000L) {
+            return accessToken
+        }
+
+        if (refreshToken.isBlank()) {
+            preferencesManager.clearSession(requirePassword = true)
+            throw IllegalStateException("Session expired. Please sign in again.")
+        }
+
+        return try {
+            when {
+                isKiaUsRegion() -> refreshKiaUsAccessToken(refreshToken)
+                isEuropeRegion() -> refreshEuropeAccessToken(refreshToken)
+                isAustraliaRegion() -> refreshAustraliaAccessToken(refreshToken)
+                isCanadaRegion() -> refreshCanadaAccessToken()
+                else -> refreshUsHyundaiAccessToken(refreshToken)
+            }
+        } catch (e: OtpRequiredException) {
+            throw e
+        } catch (e: Exception) {
+            if (isHardAuthRefreshFailure(e)) {
+                preferencesManager.clearSession(requirePassword = true)
+                throw IllegalStateException(e.message ?: "Session expired. Please sign in again.")
+            }
+            // Keep tokens on network/transient failures so the user is not bounced to login.
+            throw IllegalStateException(e.message ?: "Could not refresh session. Check your connection and try again.")
+        }
+    }
+
+    /**
+     * True when a refresh failure means the stored credentials/tokens are no longer usable.
+     * Network blips and 5xx must not wipe the session (official apps retry; they do not log out).
+     */
+    private fun isHardAuthRefreshFailure(error: Throwable): Boolean {
+        if (error is IOException) return false
+        val message = generateSequence(error) { it.cause }
+            .mapNotNull { it.message }
+            .joinToString(" ")
+            .lowercase()
+        if (message.isBlank()) return false
+        if (
+            message.contains("timeout") ||
+            message.contains("unable to resolve host") ||
+            message.contains("failed to connect") ||
+            message.contains("connection reset") ||
+            message.contains("connection refused") ||
+            message.contains("network") ||
+            message.contains("unreachable") ||
+            message.contains("sslhandshake") ||
+            Regex("\\b5\\d{2}\\b").containsMatchIn(message)
+        ) {
+            return false
+        }
+        return message.contains("invalid_grant") ||
+            message.contains("invalid_token") ||
+            message.contains("invalid token") ||
+            message.contains("invalid refresh") ||
+            message.contains("revoked") ||
+            message.contains("unauthorized") ||
+            message.contains("forbidden") ||
+            message.contains("session expired") ||
+            message.contains("sign in again") ||
+            message.contains("bad credentials") ||
+            message.contains("incorrect username") ||
+            message.contains("incorrect password") ||
+            message.contains("invalid username") ||
+            message.contains("invalid password") ||
+            message.contains("account locked") ||
+            Regex("\\b401\\b").containsMatchIn(message) ||
+            Regex("\\b403\\b").containsMatchIn(message)
+    }
+
+    private suspend fun refreshUsHyundaiAccessToken(refreshToken: String): String {
+        val savedCredentials = secureCredentialsManager.getSavedCredentials()
+        if (savedCredentials == null) {
+            // No password stored — cannot call the US refresh grant; fall back to hard expiry.
+            preferencesManager.clearSession(requirePassword = true)
+            throw IllegalStateException("Session expired. Please sign in again.")
+        }
+
+        val response = try {
+            getApiService().refreshToken(
+                RefreshTokenRequest(
+                    username = savedCredentials.username,
+                    password = savedCredentials.password,
+                    refreshToken = refreshToken
+                )
+            )
+        } catch (e: Exception) {
+            // Fall back to full password login only on soft/transport failures of the refresh call.
+            if (isHardAuthRefreshFailure(e)) throw e
+            return refreshPasswordBasedSession()
+        }
+
+        if (response.isSuccessful) {
+            val token = response.body()
+            val access = token?.accessToken.orEmpty()
+            if (access.isNotBlank()) {
+                preferencesManager.saveSession(
+                    accessToken = access,
+                    refreshToken = token?.refreshToken?.takeIf { it.isNotBlank() } ?: refreshToken,
+                    username = savedCredentials.username,
+                    expiresIn = token?.expiresIn?.toIntOrNull() ?: 1799,
+                    servicePin = savedCredentials.servicePin
+                )
+                return access
+            }
+        }
+
+        val code = response.code()
+        val errorBody = response.errorBody()?.string().orEmpty().lowercase()
+        // Hard reject of the refresh grant — try full login once before giving up.
+        if (code == 401 || code == 403 ||
+            errorBody.contains("invalid") ||
+            errorBody.contains("expired") ||
+            errorBody.contains("revoked")
+        ) {
+            return refreshPasswordBasedSession()
+        }
+        if (code in 500..599) {
+            throw IOException("Token refresh failed ($code)")
+        }
+        // Unknown non-success: prefer password re-login over wiping the session immediately.
+        return refreshPasswordBasedSession()
+    }
+
+    private suspend fun refreshPasswordBasedSession(): String {
+        val savedCredentials = secureCredentialsManager.getSavedCredentials()
+        if (savedCredentials == null) {
+            preferencesManager.clearSession(requirePassword = true)
+            throw IllegalStateException("Session expired. Please sign in again.")
+        }
+
+        return when (val result = login(
+            username = savedCredentials.username,
+            password = savedCredentials.password,
+            servicePin = savedCredentials.servicePin
+        )) {
+            is Result.Success -> preferencesManager.accessToken.first()
+                ?: throw IllegalStateException("Sign-in succeeded but no access token was saved")
+            is Result.Error -> {
+                val failure = IllegalStateException(result.message)
+                if (result.code == 401 || result.code == 403 || isHardAuthRefreshFailure(failure)) {
+                    preferencesManager.clearSession(requirePassword = true)
+                }
+                throw failure
+            }
+        }
+    }
+
+    private suspend fun refreshEuropeAccessToken(refreshToken: String): String {
+        val region = currentRegion()
+        val response = if (region == Region.EU_GENESIS || region.euIdentityBaseUrl.isBlank()) {
+            getEuApiService().refreshAccessToken(
+                authorization = region.euBasicAuthorization,
+                refreshToken = refreshToken
+            )
+        } else {
+            getEuIdentityApiService().refreshAccessToken(
+                refreshToken = refreshToken,
+                clientId = region.euServiceId,
+                clientSecret = region.euClientSecret
+            )
+        }
+        val json = response.body()
+        if (!response.isSuccessful || euResponseFailed(json)) {
+            throw IllegalStateException(euErrorMessage(json, "Europe token refresh failed (${response.code()})"))
+        }
+        val accessToken = json?.stringOrNull("access_token")
+            ?: json?.objectOrNull("retValue")?.stringOrNull("access_token")
+            ?: throw IllegalStateException("Europe token refresh did not return an access token")
+        val nextRefreshToken = json?.stringOrNull("refresh_token")
+            ?: json?.objectOrNull("retValue")?.stringOrNull("refresh_token")
+            ?: refreshToken
+        val expiresIn = json?.intOrNull("expires_in")
+            ?: json?.objectOrNull("retValue")?.intOrNull("expires_in")
+            ?: 1800
+        val normalizedAccessToken = normalizeBearerlessToken(accessToken)
+        preferencesManager.saveSession(
+            accessToken = normalizedAccessToken,
+            refreshToken = normalizeBearerlessToken(nextRefreshToken),
+            username = getUsername(),
+            expiresIn = expiresIn.coerceAtLeast(60) - 60,
+            servicePin = getServicePin(required = false)
+        )
+        return normalizedAccessToken
+    }
+
+    private suspend fun refreshAustraliaAccessToken(refreshToken: String): String {
+        val region = currentRegion()
+        val stamp = AuApiClient(region, preferencesManager.getOrCreateAuDeviceId()).stamp()
+        val response = getAuApiService().refreshAccessToken(
+            authorization = region.auBasicAuthorization,
+            stamp = stamp,
+            refreshToken = refreshToken
+        )
+        val json = response.body()
+        if (!response.isSuccessful || auResponseFailed(json)) {
+            throw IllegalStateException(auErrorMessage(json, "Australia token refresh failed (${response.code()})"))
+        }
+        val accessToken = json?.stringOrNull("access_token")
+            ?: json?.objectOrNull("retValue")?.stringOrNull("access_token")
+            ?: throw IllegalStateException("Australia token refresh did not return an access token")
+        val nextRefreshToken = json?.stringOrNull("refresh_token")
+            ?: json?.objectOrNull("retValue")?.stringOrNull("refresh_token")
+            ?: refreshToken
+        val expiresIn = json?.intOrNull("expires_in")
+            ?: json?.objectOrNull("retValue")?.intOrNull("expires_in")
+            ?: 82800
+        val normalizedAccessToken = normalizeBearerlessToken(accessToken)
+        preferencesManager.saveSession(
+            accessToken = normalizedAccessToken,
+            refreshToken = normalizeBearerlessToken(nextRefreshToken),
+            username = getUsername(),
+            expiresIn = expiresIn.coerceAtLeast(60) - 60,
+            servicePin = getServicePin(required = false)
+        )
+        return normalizedAccessToken
+    }
+
+    private fun validateCommandResponse(response: retrofit2.Response<CommandResponse>, actionName: String): Result<Unit> {
+        val body = response.body()
+        if (!response.isSuccessful) {
+            return Result.Error("$actionName failed (${response.code()})", response.code())
+        }
+        if (body?.isInvalidPin == true) {
+            val attempts = body.remainingAttemptCount?.takeIf { it.isNotBlank() }
+            val suffix = attempts?.let { " $it attempt(s) remaining." }.orEmpty()
+            return Result.Error("Incorrect Bluelink PIN.$suffix Update it in Settings > Account before trying again.")
+        }
+        body?.userMessage?.let { message ->
+            if (message.contains("invalid", ignoreCase = true) ||
+                message.contains("failed", ignoreCase = true) ||
+                message.contains("error", ignoreCase = true)
+            ) {
+                return Result.Error(message)
+            }
+        }
+        return Result.Success(Unit)
+    }
+
+    private fun validateEmptyCommandResponse(response: retrofit2.Response<ResponseBody>, actionName: String): Result<Unit> {
+        if (!response.isSuccessful) {
+            return Result.Error("$actionName failed (${response.code()})", response.code())
+        }
+        return Result.Success(Unit)
+    }
+
+    private fun validateRawCommandResponse(response: retrofit2.Response<ResponseBody>, actionName: String): Result<Unit> {
+        val rawBody = try {
+            response.body()?.string().orEmpty()
+        } catch (_: Exception) {
+            ""
+        }
+
+        val rawErrorBody = try {
+            response.errorBody()?.string().orEmpty()
+        } catch (_: Exception) {
+            ""
+        }
+
+        if (!response.isSuccessful) {
+            val serverMessage = extractCommandErrorMessage(rawErrorBody)
+            return Result.Error(serverMessage ?: "$actionName failed (${response.code()})", response.code())
+        }
+
+        if (rawBody.isBlank()) {
+            return Result.Success(Unit)
+        }
+
+        extractCommandErrorMessage(rawBody)?.let { message ->
+            return Result.Error(message)
+        }
+
+        return Result.Success(Unit)
+    }
+
+    private fun extractCommandErrorMessage(rawJson: String): String? {
+        if (rawJson.isBlank()) return null
+
+        return try {
+            val element = JsonParser.parseString(rawJson)
+            if (!element.isJsonObject) return null
+            val json = element.asJsonObject
+
+            val canadaResponseCode = json.objectOrNull("responseHeader")?.intOrNull("responseCode")
+            if (canadaResponseCode != null && canadaResponseCode != 0) {
+                val error = json.objectOrNull("error")
+                val errorDesc = error?.stringOrNull("errorDesc")
+                    ?: error?.stringOrNull("errorMessage")
+                    ?: error?.stringOrNull("message")
+                val errorCode = error?.stringOrNull("errorCode")
+                val headerDesc = json.objectOrNull("responseHeader")?.stringOrNull("responseDesc")
+                return when {
+                    !errorDesc.isNullOrBlank() && !errorCode.isNullOrBlank() -> "$errorDesc ($errorCode)"
+                    !errorDesc.isNullOrBlank() -> errorDesc
+                    !errorCode.isNullOrBlank() -> "Request failed ($errorCode)"
+                    !headerDesc.isNullOrBlank() -> headerDesc
+                    else -> "Request failed"
+                }
+            }
+
+            val pinValid = json.stringOrNull("isBlueLinkServicePinValid")
+            if (pinValid?.equals("invalid", ignoreCase = true) == true) {
+                val attempts = json.stringOrNull("remainingAttemptCount")?.takeIf { it.isNotBlank() }
+                val suffix = attempts?.let { " $it attempt(s) remaining." }.orEmpty()
+                return "Incorrect Bluelink PIN.$suffix Update it in Settings > Account before trying again."
+            }
+
+            val invalidAttempt = json.stringOrNull("invalidAttemptMessage")
+            if (!invalidAttempt.isNullOrBlank()) {
+                return invalidAttempt
+            }
+
+            json.objectOrNull("status")?.let { status ->
+                val statusCode = status.intOrNull("statusCode") ?: 0
+                val message = status.stringOrNull("errorMessage") ?: status.stringOrNull("message")
+                if (statusCode != 0 && !message.isNullOrBlank()) return message
+            }
+
+            val errorMessage = json.stringOrNull("errorMessage")
+                ?: json.stringOrNull("message")
+                ?: json.stringOrNull("error")
+
+            errorMessage?.takeIf { message ->
+                message.contains("invalid", ignoreCase = true) ||
+                    message.contains("failed", ignoreCase = true) ||
+                    message.contains("error", ignoreCase = true) ||
+                    message.contains("incorrect", ignoreCase = true)
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun JsonObject.stringOrNull(name: String): String? {
+        val value = get(name) ?: return null
+        if (value.isJsonNull) return null
+        return runCatching { value.asString }.getOrNull()
+    }
+
+
+    // ─── Canada TODS helpers ────────────────────────────────────────────────────
+
+    private fun JsonObject.objectOrNull(name: String): JsonObject? {
+        val value = get(name) ?: return null
+        return if (!value.isJsonNull && value.isJsonObject) value.asJsonObject else null
+    }
+
+    private fun JsonObject.arrayOrNull(name: String): JsonArray? {
+        val value = get(name) ?: return null
+        return if (!value.isJsonNull && value.isJsonArray) value.asJsonArray else null
+    }
+
+    private fun JsonObject.intOrNull(name: String): Int? {
+        val value = get(name) ?: return null
+        if (value.isJsonNull) return null
+        return runCatching { value.asInt }.getOrNull()
+            ?: runCatching { value.asString.toDouble().roundToInt() }.getOrNull()
+    }
+
+    private fun normalizeEuropeDistanceUnits(status: JsonObject): JsonObject {
+        // EU/Canadian-style CCSP range payloads report drvDistance/dte unit=1 values in kilometers.
+        // The app's shared model keeps unit=1 as miles for North American US payloads, so normalize
+        // EU ranges to unit=2 before deserialization to avoid displaying ~1.609x inflated km values.
+        fun normalizeRangeValue(range: JsonObject?) {
+            if (range?.intOrNull("unit") == 1) {
+                range.addProperty("unit", 2)
+            }
+        }
+
+        fun JsonElement?.numericDoubleOrNull(): Double? {
+            val element = this ?: return null
+            if (element.isJsonNull) return null
+            if (element.isJsonPrimitive) {
+                return runCatching { element.asDouble }.getOrNull()
+                    ?: runCatching { element.asString.filter { it.isDigit() || it == '.' || it == '-' }.toDouble() }.getOrNull()
+            }
+            if (element.isJsonObject) {
+                val obj = element.asJsonObject
+                listOf("value", "odometer", "totalMileage", "mileage", "distance", "distanceToEmpty").forEach { key ->
+                    obj.get(key).numericDoubleOrNull()?.let { return it }
+                }
+            }
+            return null
+        }
+
+        fun normalizeOdometer() {
+            val odometer = status.get("odometer") ?: return
+            odometer.numericDoubleOrNull()?.let { status.addProperty("odometer", it.roundToInt()) }
+        }
+
+        fun normalizeAirTemperature() {
+            val airTemp = status.objectOrNull("airTemp") ?: return
+            val valueElement = airTemp.get("value") ?: return
+            val numeric = valueElement.numericDoubleOrNull()
+            val raw = runCatching { valueElement.asString }.getOrNull().orEmpty().trim()
+            if (numeric != null) {
+                airTemp.addProperty("value", numeric.roundToInt().toString())
+            } else if (raw.isBlank() || raw.equals("00H", ignoreCase = true) || raw.equals("OFF", ignoreCase = true) || raw == "0") {
+                status.remove("airTemp")
+            }
+        }
+
+        fun numberFromNamedPath(obj: JsonObject?, names: Set<String>): Int? {
+            obj ?: return null
+            obj.entrySet().forEach { (key, value) ->
+                val lower = key.lowercase()
+                if (names.any { lower == it || lower.contains(it) }) {
+                    value.numericDoubleOrNull()?.roundToInt()?.takeIf { it > 0 }?.let { return it }
+                }
+                if (value.isJsonObject) {
+                    numberFromNamedPath(value.asJsonObject, names)?.let { return it }
+                }
+            }
+            return null
+        }
+
+        fun normalizeTirePressure() {
+            val tire = status.objectOrNull("tirePressure") ?: return
+            val existingHasPressure = listOf(
+                "tirePressureFrontLeft",
+                "tirePressureFrontRight",
+                "tirePressureRearLeft",
+                "tirePressureRearRight"
+            ).any { (tire.intOrNull(it) ?: 0) > 0 }
+            if (existingHasPressure) return
+
+            numberFromNamedPath(tire, setOf("tirepressurefrontleft", "frontleftpressure", "frontleftpsi", "frontleft", "flpressure", "flpsi", "fl"))
+                ?.let { tire.addProperty("tirePressureFrontLeft", it) }
+            numberFromNamedPath(tire, setOf("tirepressurefrontright", "frontrightpressure", "frontrightpsi", "frontright", "frpressure", "frpsi", "fr"))
+                ?.let { tire.addProperty("tirePressureFrontRight", it) }
+            numberFromNamedPath(tire, setOf("tirepressurerearleft", "rearleftpressure", "rearleftpsi", "rearleft", "rlpressure", "rlpsi", "rl"))
+                ?.let { tire.addProperty("tirePressureRearLeft", it) }
+            numberFromNamedPath(tire, setOf("tirepressurerearright", "rearrightpressure", "rearrightpsi", "rearright", "rrpressure", "rrpsi", "rr"))
+                ?.let { tire.addProperty("tirePressureRearRight", it) }
+        }
+
+        normalizeRangeValue(status.objectOrNull("dte"))
+        val distances = status.objectOrNull("evStatus")?.arrayOrNull("drvDistance")
+        distances?.forEach { entry ->
+            val rangeByFuel = entry.takeIfJsonObject()?.objectOrNull("rangeByFuel")
+            normalizeRangeValue(rangeByFuel?.objectOrNull("totalAvailableRange"))
+            normalizeRangeValue(rangeByFuel?.objectOrNull("evModeRange"))
+            normalizeRangeValue(rangeByFuel?.objectOrNull("gasModeRange"))
+        }
+        normalizeOdometer()
+        normalizeAirTemperature()
+        normalizeTirePressure()
+        return status
+    }
+
+    private fun canadaErrorMessage(json: JsonObject?, fallback: String): String {
+        val error = json?.objectOrNull("error")
+        val errorDesc = error?.stringOrNull("errorDesc")
+            ?: error?.stringOrNull("errorMessage")
+            ?: error?.stringOrNull("message")
+            ?: json?.objectOrNull("responseHeader")?.stringOrNull("responseDesc")
+        val errorCode = error?.stringOrNull("errorCode")
+            ?: json?.objectOrNull("responseHeader")?.stringOrNull("responseCode")?.toString()
+        if (errorCode == "6533") {
+            return errorDesc?.takeIf { it.isNotBlank() }
+                ?: "BlueLink is still processing an earlier request. Please wait about 90 seconds, then try again."
+        }
+        return when {
+            !errorDesc.isNullOrBlank() && !errorCode.isNullOrBlank() -> "$fallback ($errorCode): $errorDesc"
+            !errorDesc.isNullOrBlank() -> errorDesc
+            !errorCode.isNullOrBlank() -> "$fallback ($errorCode)"
+            else -> fallback
+        }
+    }
+
+    private fun canadaResponseFailed(json: JsonObject?): Boolean {
+        val responseCode = json?.objectOrNull("responseHeader")?.intOrNull("responseCode")
+        return responseCode != null && responseCode != 0
+    }
+
+    private fun canadaOtpRequired(json: JsonObject?): Boolean = CanadaMfaResponses.isOtpRequired(json)
+
+    private fun canadaOtpMethodCode(method: OtpDeliveryMethod): String = when (method) {
+        OtpDeliveryMethod.EMAIL -> "E"
+        OtpDeliveryMethod.SMS -> "S"
+    }
+
+    private fun canadaAvailableMethods(email: String?, phone: String?): Set<OtpDeliveryMethod> = buildSet {
+        if (!email.isNullOrBlank()) add(OtpDeliveryMethod.EMAIL)
+        if (!phone.isNullOrBlank()) add(OtpDeliveryMethod.SMS)
+        if (isEmpty()) add(OtpDeliveryMethod.EMAIL)
+    }
+
+    private fun canadaDestinationLabel(method: OtpDeliveryMethod, email: String, phone: String?): String = when (method) {
+        OtpDeliveryMethod.EMAIL -> email.let { "email $it" }
+        OtpDeliveryMethod.SMS -> when {
+            CanadaMfaResponses.hasSmsDestination(phone) -> "phone $phone"
+            else -> "your phone"
+        }
+    }
+
+    private suspend fun canadaSendOtp(
+        deviceId: String,
+        userInfoUuid: String,
+        otpEmail: String,
+        phone: String?,
+        method: OtpDeliveryMethod
+    ): Result<String> {
+        val response = getCanadaApiService().sendOtp(
+            deviceId = deviceId,
+            body = mapOf(
+                "otpMethod" to canadaOtpMethodCode(method),
+                "mfaApiCode" to CanadaMfaResponses.MFA_API_CODE,
+                "userAccount" to otpEmail,
+                "userPhone" to if (method == OtpDeliveryMethod.SMS) {
+                    CanadaMfaResponses.smsPhoneForSend(phone)
+                } else {
+                    ""
+                },
+                "userInfoUuid" to userInfoUuid
+            )
+        )
+        val raw = readCanadaHttpBody(response)
+        val json = parseCanadaJsonBody(raw)
+        if (json == null) {
+            return Result.Error(canadaUnreadableBodyMessage(raw, response.code()), response.code())
+        }
+        if (!CanadaMfaResponses.isSuccess(json)) {
+            return Result.Error(canadaErrorMessage(json, "Could not send verification code (${response.code()})"), response.code())
+        }
+        val otpKey = CanadaMfaResponses.parseSendOtpKey(json)
+            ?: return Result.Error("Verification code could not be sent.")
+        return Result.Success(otpKey)
+    }
+
+    private suspend fun startCanadaOtpChallenge(
+        username: String,
+        password: String,
+        servicePin: String,
+        method: OtpDeliveryMethod? = null,
+        fromRefresh: Boolean = false
+    ): Result<Unit> {
+        val deviceId = preferencesManager.getOrCreateCanadaDeviceId()
+        val selResponse = getCanadaApiService().selectVerificationMethod(
+            deviceId = deviceId,
+            body = mapOf(
+                "mfaApiCode" to CanadaMfaResponses.MFA_API_CODE,
+                "userAccount" to username
+            )
+        )
+        val selRaw = readCanadaHttpBody(selResponse)
+        val selJson = parseCanadaJsonBody(selRaw)
+        if (selJson == null) {
+            return Result.Error(canadaUnreadableBodyMessage(selRaw, selResponse.code()), selResponse.code())
+        }
+        if (!CanadaMfaResponses.isSuccess(selJson)) {
+            return Result.Error(canadaErrorMessage(selJson, "Could not start verification (${selResponse.code()})"), selResponse.code())
+        }
+        val methods = CanadaMfaResponses.parseVerificationMethods(selJson)
+            ?: return Result.Error("Verification setup did not return contact options.")
+        val email = methods.userAccount ?: methods.email ?: username
+        val available = canadaAvailableMethods(methods.email ?: email, methods.phone)
+        val selected = when {
+            method != null && method in available -> method
+            OtpDeliveryMethod.SMS in available && OtpDeliveryMethod.EMAIL !in available -> OtpDeliveryMethod.SMS
+            OtpDeliveryMethod.EMAIL in available -> OtpDeliveryMethod.EMAIL
+            else -> available.first()
+        }
+        when (val sendResult = canadaSendOtp(
+            deviceId = deviceId,
+            userInfoUuid = methods.userInfoUuid,
+            otpEmail = email,
+            phone = methods.phone,
+            method = selected
+        )) {
+            is Result.Error -> return sendResult
+            is Result.Success -> {
+                pendingOtpChallenge = PendingOtpChallenge.Canada(
+                    username = username,
+                    password = password,
+                    servicePin = servicePin,
+                    destinationLabel = canadaDestinationLabel(selected, email, methods.phone),
+                    availableMethods = available,
+                    selectedMethod = selected,
+                    userInfoUuid = methods.userInfoUuid,
+                    otpKey = sendResult.data,
+                    email = email,
+                    phone = methods.phone
+                )
+                val message = if (fromRefresh) {
+                    "Session expired. A verification code was sent to ${canadaDestinationLabel(selected, email, methods.phone)}."
+                } else {
+                    "A verification code was sent to ${canadaDestinationLabel(selected, email, methods.phone)}. Enter that code below to finish signing in."
+                }
+                pendingOtpMessage = message
+                if (fromRefresh) {
+                    preferencesManager.setOtpPending(username)
+                }
+                return Result.Error(message, OTP_REQUIRED_CODE)
+            }
+            else -> return Result.Error("Could not send verification code.")
+        }
+    }
+
+    private suspend fun loginCanada(
+        username: String,
+        password: String,
+        servicePin: String,
+        fromRefresh: Boolean = false
+    ): Result<Unit> {
+        return try {
+            pendingOtpChallenge = null
+            pendingOtpMessage = null
+            val deviceId = preferencesManager.getOrCreateCanadaDeviceId()
+            val response = getCanadaApiService().login(
+                deviceId = deviceId,
+                body = mapOf("loginId" to username, "password" to password)
+            )
+            val raw = readCanadaHttpBody(response)
+            val json = parseCanadaJsonBody(raw)
+            if (json == null) {
+                return Result.Error(canadaUnreadableBodyMessage(raw, response.code()), response.code())
+            }
+            if (!response.isSuccessful && !canadaOtpRequired(json)) {
+                return Result.Error(canadaErrorMessage(json, "Canada login failed (${response.code()})"), response.code())
+            }
+            if (canadaOtpRequired(json)) {
+                return startCanadaOtpChallenge(username, password, servicePin, fromRefresh = fromRefresh)
+            }
+            if (canadaResponseFailed(json)) {
+                return Result.Error(canadaErrorMessage(json, "Canada login failed"))
+            }
+            val token = json.objectOrNull("result")?.objectOrNull("token")
+                ?: return Result.Error("Canada login did not return a token")
+            saveCanadaSession(username, password, servicePin, token)
+            Result.Success(Unit)
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Canada login network error")
+        }
+    }
+
+    private suspend fun saveCanadaSession(
+        username: String,
+        password: String,
+        servicePin: String,
+        token: JsonObject
+    ) {
+        preferencesManager.saveSession(
+            accessToken = token.stringOrNull("accessToken").orEmpty(),
+            refreshToken = token.stringOrNull("refreshToken").orEmpty(),
+            username = username,
+            expiresIn = (token.intOrNull("expireIn") ?: 1800).coerceAtLeast(60) - 60,
+            servicePin = servicePin
+        )
+        preferencesManager.clearOtpPending()
+        if (preferencesManager.stayLoggedIn30Days.first()) {
+            secureCredentialsManager.saveCredentials(username, password, servicePin)
+        }
+    }
+
+    private fun isCanadaAuthFailure(code: Int, json: JsonObject?): Boolean {
+        if (code == 401 || code == 403) return true
+        val errorCode = json?.objectOrNull("error")?.stringOrNull("errorCode").orEmpty()
+        // 7403 = auth expired, 7404 = bad credentials, 7602 = access token deleted.
+        return errorCode == "7403" || errorCode == "7404" || errorCode == "7602"
+    }
+
+    private suspend fun refreshCanadaAccessToken(): String {
+        val savedCredentials = secureCredentialsManager.getSavedCredentials()
+        if (savedCredentials == null) {
+            preferencesManager.clearSession(requirePassword = true)
+            throw IllegalStateException("Session expired. Please sign in again.")
+        }
+
+        return when (
+            val result = loginCanada(
+                username = savedCredentials.username,
+                password = savedCredentials.password,
+                servicePin = savedCredentials.servicePin,
+                fromRefresh = true
+            )
+        ) {
+            is Result.Success -> preferencesManager.accessToken.first()
+                .orEmpty()
+                .takeIf { it.isNotBlank() }
+                ?: run {
+                    preferencesManager.clearSession(requirePassword = true)
+                    throw IllegalStateException("Sign-in succeeded but no access token was saved")
+                }
+            is Result.Error -> {
+                if (result.code == OTP_REQUIRED_CODE) {
+                    throw OtpRequiredException(result.message)
+                }
+                val failure = IllegalStateException(result.message)
+                if (result.code == 401 || result.code == 403 || isHardAuthRefreshFailure(failure)) {
+                    preferencesManager.clearSession(requirePassword = true)
+                }
+                throw failure
+            }
+        }
+    }
+
+    /**
+     * Re-authenticate once when the Canadian API rejects the current access token.
+     * Returns a fresh token, or null when the session should be treated as expired.
+     */
+    private suspend fun canadaAccessTokenAfterAuthFailure(
+        httpCode: Int,
+        json: JsonObject?,
+        alreadyRetried: Boolean
+    ): String? {
+        if (!isCanadaAuthFailure(httpCode, json)) return null
+        if (alreadyRetried) {
+            preferencesManager.clearSession(requirePassword = true)
+            return null
+        }
+        return runCatching { refreshCanadaAccessToken() }.getOrNull()
+    }
+
+    private suspend fun getCanadaVehicles(): Result<List<Vehicle>> {
+        return try {
+            fetchCanadaVehicles(accessToken = getToken(), retried = false)
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Canada vehicle list network error")
+        }
+    }
+
+    private suspend fun fetchCanadaVehicles(accessToken: String, retried: Boolean): Result<List<Vehicle>> {
+            val deviceId = preferencesManager.getOrCreateCanadaDeviceId()
+            val response = getCanadaApiService().getVehicles(accessToken, deviceId)
+            val raw = readCanadaHttpBody(response)
+            val json = parseCanadaJsonBody(raw)
+            if (json == null) {
+                return Result.Error(canadaUnreadableBodyMessage(raw, response.code()), response.code())
+            }
+            if (!response.isSuccessful || canadaResponseFailed(json)) {
+                val refreshedToken = canadaAccessTokenAfterAuthFailure(response.code(), json, retried)
+                if (refreshedToken != null) return fetchCanadaVehicles(refreshedToken, retried = true)
+                if (isCanadaAuthFailure(response.code(), json)) {
+                    return Result.Error("Session expired. Please sign in again.", response.code())
+                }
+                return Result.Error(canadaErrorMessage(json, "Failed to fetch Canadian vehicles (${response.code()})"), response.code())
+            }
+            val region = currentRegion()
+            val brand = when (region) {
+                Region.CA_KIA -> "K"
+                Region.CA_GENESIS -> "G"
+                else -> "H"
+            }
+            val vehicles = json.objectOrNull("result")?.arrayOrNull("vehicles")
+                ?.mapNotNull { it.takeIfJsonObject() }
+                ?.map { entry ->
+                    val vehicleId = entry.stringOrNull("vehicleId").orEmpty()
+                    val fuelCode = entry.stringOrNull("fuelKindCode").orEmpty()
+                    val modelName = entry.stringOrNull("modelName").orEmpty()
+                    Vehicle(
+                        vin = entry.stringOrNull("vin").orEmpty(),
+                        vehicleIdentifier = vehicleId,
+                        enrollmentId = vehicleId,
+                        regId = vehicleId,
+                        generation = "3",
+                        nickname = entry.stringOrNull("nickName").orEmpty(),
+                        modelCode = if (fuelCode == "E") "$modelName EV" else modelName,
+                        modelName = modelName,
+                        modelYear = entry.stringOrNull("modelYear").orEmpty(),
+                        brandIndicator = brand,
+                        odometer = entry.intOrNull("odometer") ?: 0
+                    )
+                }.orEmpty()
+            return Result.Success(vehicles)
+    }
+
+    private fun JsonElement.takeIfJsonObject(): JsonObject? =
+        if (!isJsonNull && isJsonObject) asJsonObject else null
+
+    private suspend fun getCanadaVehicleStatus(vin: String, forceRefresh: Boolean, registrationId: String): Result<VehicleStatusData> {
+        return try {
+            fetchCanadaVehicleStatus(
+                accessToken = getToken(),
+                vin = vin,
+                forceRefresh = forceRefresh,
+                registrationId = registrationId,
+                retried = false
+            )
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Canada status network error")
+        }
+    }
+
+    private suspend fun fetchCanadaVehicleStatus(
+        accessToken: String,
+        vin: String,
+        forceRefresh: Boolean,
+        registrationId: String,
+        retried: Boolean
+    ): Result<VehicleStatusData> {
+        val deviceId = preferencesManager.getOrCreateCanadaDeviceId()
+        val vehicleId = registrationId.ifBlank { vin }
+        val api = getCanadaApiService()
+        val response = if (forceRefresh) {
+            api.getLiveVehicleStatus(accessToken, vehicleId, deviceId)
+        } else {
+            api.getCachedVehicleStatus(accessToken, vehicleId, deviceId)
+        }
+        val raw = readCanadaHttpBody(response)
+        val json = parseCanadaJsonBody(raw)
+        if (json == null) {
+            return Result.Error(canadaUnreadableBodyMessage(raw, response.code()), response.code())
+        }
+        if (!response.isSuccessful || canadaResponseFailed(json)) {
+            val refreshedToken = canadaAccessTokenAfterAuthFailure(response.code(), json, retried)
+            if (refreshedToken != null) {
+                return fetchCanadaVehicleStatus(
+                    accessToken = refreshedToken,
+                    vin = vin,
+                    forceRefresh = forceRefresh,
+                    registrationId = registrationId,
+                    retried = true
+                )
+            }
+            if (isCanadaAuthFailure(response.code(), json)) {
+                return Result.Error("Session expired. Please sign in again.", response.code())
+            }
+            return Result.Error(canadaErrorMessage(json, "Canadian status fetch failed (${response.code()})"), response.code())
+        }
+        val status = json.objectOrNull("result")?.objectOrNull("status")
+            ?: return Result.Error("Could not parse Canadian vehicle status")
+        val data = gson.fromJson(normalizeCanadaVehicleStatus(status), VehicleStatusData::class.java)
+        preferencesManager.setLastStatusRefresh(System.currentTimeMillis())
+        return Result.Success(data)
+    }
+
+    /**
+     * Canada status uses [airCtrlOn] (same as our model) when present, but some payloads
+     * only expose [airCtrl]. Seat climate is under [seatHeaterVentState] with fl/fr keys
+     * rather than [seatHeaterVentInfo] with drv/ast keys.
+     */
+    private fun normalizeCanadaVehicleStatus(status: JsonObject): JsonObject {
+        val normalized = normalizeEuropeDistanceUnits(status).deepCopy()
+
+        if (!normalized.has("airCtrlOn") && normalized.has("airCtrl")) {
+            when (val airCtrl = normalized.get("airCtrl")) {
+                null, is com.google.gson.JsonNull -> Unit
+                else -> {
+                    val on = when {
+                        airCtrl.isJsonPrimitive && airCtrl.asJsonPrimitive.isBoolean -> airCtrl.asBoolean
+                        airCtrl.isJsonPrimitive && airCtrl.asJsonPrimitive.isNumber -> airCtrl.asInt != 0
+                        airCtrl.isJsonPrimitive && airCtrl.asJsonPrimitive.isString -> {
+                            val raw = airCtrl.asString.trim()
+                            raw.equals("true", ignoreCase = true) || raw == "1"
+                        }
+                        else -> false
+                    }
+                    normalized.addProperty("airCtrlOn", on)
+                }
+            }
+        }
+
+        if (!normalized.has("seatHeaterVentInfo")) {
+            val seatState = normalized.objectOrNull("seatHeaterVentState")
+                ?: normalized.objectOrNull("seatHeaterVentInfo")
+            if (seatState != null) {
+                normalized.add("seatHeaterVentInfo", JsonObject().apply {
+                    addProperty(
+                        "drvSeatHeatState",
+                        seatState.intOrNull("flSeatHeatState")
+                            ?: seatState.intOrNull("drvSeatHeatState")
+                            ?: 0
+                    )
+                    addProperty(
+                        "astSeatHeatState",
+                        seatState.intOrNull("frSeatHeatState")
+                            ?: seatState.intOrNull("astSeatHeatState")
+                            ?: 0
+                    )
+                    addProperty(
+                        "rlSeatHeatState",
+                        seatState.intOrNull("rlSeatHeatState") ?: 0
+                    )
+                    addProperty(
+                        "rrSeatHeatState",
+                        seatState.intOrNull("rrSeatHeatState") ?: 0
+                    )
+                })
+            }
+        }
+
+        return normalized
+    }
+
+    private suspend fun getCanadaPinAuth(
+        accessToken: String,
+        vehicleId: String,
+        pin: String,
+        deviceId: String,
+        retried: Boolean = false
+    ): String {
+        val response = getCanadaApiService().verifyPin(accessToken, vehicleId, deviceId, mapOf("pin" to pin))
+        val raw = readCanadaHttpBody(response)
+        val json = parseCanadaJsonBody(raw)
+        if (json == null) {
+            throw IllegalStateException(canadaUnreadableBodyMessage(raw, response.code()))
+        }
+        if (!response.isSuccessful || canadaResponseFailed(json)) {
+            val refreshedToken = canadaAccessTokenAfterAuthFailure(response.code(), json, retried)
+            if (refreshedToken != null) {
+                return getCanadaPinAuth(refreshedToken, vehicleId, pin, deviceId, retried = true)
+            }
+            if (isCanadaAuthFailure(response.code(), json)) {
+                throw IllegalStateException("Session expired. Please sign in again.")
+            }
+            throw IllegalStateException(canadaErrorMessage(json, "Canadian PIN verification failed (${response.code()})"))
+        }
+        return json.objectOrNull("result")?.stringOrNull("pAuth")
+            ?: throw IllegalStateException("Canadian PIN verification did not return pAuth")
+    }
+
+    private sealed interface CanadaCommandOutcome {
+        data object Ok : CanadaCommandOutcome
+        data class Failed(val message: String, val code: Int? = null) : CanadaCommandOutcome
+        data class AuthFailed(val httpCode: Int, val json: JsonObject?) : CanadaCommandOutcome
+    }
+
+    private fun readRawResponseBody(response: retrofit2.Response<ResponseBody>): String {
+        val body = try {
+            response.body()?.string().orEmpty()
+        } catch (_: Exception) {
+            ""
+        }
+        if (body.isNotBlank()) return body
+        return try {
+            response.errorBody()?.string().orEmpty()
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    private fun classifyCanadaCommandResponse(
+        httpCode: Int,
+        rawJson: String,
+        actionName: String
+    ): CanadaCommandOutcome {
+        val json = if (rawJson.isBlank()) {
+            null
+        } else {
+            try {
+                JsonParser.parseString(rawJson).takeIf { it.isJsonObject }?.asJsonObject
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+        if (json != null && canadaResponseFailed(json)) {
+            if (isCanadaAuthFailure(httpCode, json)) {
+                return CanadaCommandOutcome.AuthFailed(httpCode, json)
+            }
+            return CanadaCommandOutcome.Failed(
+                canadaErrorMessage(json, "$actionName failed ($httpCode)"),
+                httpCode
+            )
+        }
+
+        if (httpCode !in 200..299) {
+            if (json != null && isCanadaAuthFailure(httpCode, json)) {
+                return CanadaCommandOutcome.AuthFailed(httpCode, json)
+            }
+            val message = extractCommandErrorMessage(rawJson)
+                ?: "$actionName failed ($httpCode)"
+            return CanadaCommandOutcome.Failed(message, httpCode)
+        }
+
+        if (rawJson.isNotBlank()) {
+            extractCommandErrorMessage(rawJson)?.let { message ->
+                return CanadaCommandOutcome.Failed(message, httpCode)
+            }
+        }
+
+        return CanadaCommandOutcome.Ok
+    }
+
+    private suspend fun runCanadaPinCommand(
+        vin: String,
+        registrationId: String,
+        actionName: String,
+        call: suspend (accessToken: String, vehicleId: String, pAuth: String, deviceId: String, pin: String) -> retrofit2.Response<ResponseBody>
+    ): Result<Unit> {
+        return try {
+            executeCanadaPinCommand(vin, registrationId, actionName, call, retried = false)
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "$actionName failed")
+        }
+    }
+
+    private suspend fun executeCanadaPinCommand(
+        vin: String,
+        registrationId: String,
+        actionName: String,
+        call: suspend (accessToken: String, vehicleId: String, pAuth: String, deviceId: String, pin: String) -> retrofit2.Response<ResponseBody>,
+        retried: Boolean
+    ): Result<Unit> {
+        val accessToken = getToken()
+        val pin = getServicePin()
+        val deviceId = preferencesManager.getOrCreateCanadaDeviceId()
+        val vehicleId = registrationId.ifBlank { vin }
+        val pAuth = getCanadaPinAuth(accessToken, vehicleId, pin, deviceId)
+        val response = call(accessToken, vehicleId, pAuth, deviceId, pin)
+        val rawBody = readRawResponseBody(response)
+        return when (val outcome = classifyCanadaCommandResponse(response.code(), rawBody, actionName)) {
+            CanadaCommandOutcome.Ok -> Result.Success(Unit)
+            is CanadaCommandOutcome.Failed -> Result.Error(outcome.message, outcome.code)
+            is CanadaCommandOutcome.AuthFailed -> {
+                val refreshedToken = canadaAccessTokenAfterAuthFailure(outcome.httpCode, outcome.json, retried)
+                if (refreshedToken != null) {
+                    executeCanadaPinCommand(vin, registrationId, actionName, call, retried = true)
+                } else {
+                    Result.Error("Session expired. Please sign in again.", outcome.httpCode)
+                }
+            }
+        }
+    }
+
+    private fun canadaClimateTempHexFromF(tempF: String): String {
+        val fahrenheit = tempF.toDoubleOrNull() ?: 72.0
+        val celsius = ((fahrenheit - 32.0) * 5.0 / 9.0).coerceIn(14.0, 31.5)
+        val halfStep = ((celsius - 14.0) / 0.5).roundToInt().coerceIn(0, 35)
+        return halfStep.toString(16).padStart(2, '0').uppercase() + "H"
+    }
+
+    /** Canada seat commands use 0 for off; BlueDeck UI uses Hyundai USA code 2 for off. */
+    private fun canadaSeatCommand(level: Int): Int = when (level) {
+        0, 2 -> 0
+        else -> level
+    }
+
+    /**
+     * Canada EV climate payloads:
+     * - Most EVs accept `hvacInfo`
+     * - Newer models (IONIQ 9, EV9, etc.) require `remoteControl` and return error 15109 otherwise
+     */
+    private fun canadaClimatePayload(
+        pin: String,
+        tempF: String,
+        defrost: Boolean,
+        durationMinutes: Int,
+        isEv: Boolean,
+        useRemoteControl: Boolean = false,
+        driverSeat: Int = 0,
+        passengerSeat: Int = 0,
+        rearLeftSeat: Int = 0,
+        rearRightSeat: Int = 0
+    ): JsonObject {
+        val airTemp = JsonObject().apply {
+            addProperty("value", canadaClimateTempHexFromF(tempF))
+            addProperty("unit", 0)
+            addProperty("hvacTempType", if (isEv) 1 else 0)
+        }
+        val seatCommands = JsonObject().apply {
+            addProperty("drvSeatOptCmd", canadaSeatCommand(driverSeat))
+            addProperty("astSeatOptCmd", canadaSeatCommand(passengerSeat))
+            addProperty("rlSeatOptCmd", canadaSeatCommand(rearLeftSeat))
+            addProperty("rrSeatOptCmd", canadaSeatCommand(rearRightSeat))
+        }
+        val settings = JsonObject().apply {
+            addProperty("airCtrl", 1)
+            addProperty("defrost", defrost)
+            addProperty("heating1", 0)
+            addProperty("igniOnDuration", durationMinutes)
+            add("airTemp", airTemp)
+            add("seatHeaterVentCMD", seatCommands)
+            if (!isEv) addProperty("ims", 0)
+        }
+        return JsonObject().apply {
+            addProperty("pin", pin)
+            when {
+                !isEv -> add("setting", settings)
+                useRemoteControl -> add("remoteControl", settings)
+                else -> add("hvacInfo", settings)
+            }
+        }
+    }
+
+    private fun canadaErrorCode(json: JsonObject?): String? =
+        json?.objectOrNull("error")?.stringOrNull("errorCode")
+
+    private suspend fun startCanadaClimate(
+        vin: String,
+        registrationId: String,
+        tempF: String,
+        defrost: Boolean,
+        durationMinutes: Int,
+        isEv: Boolean,
+        driverSeatHeat: Int,
+        passengerSeatHeat: Int,
+        rearLeftSeatHeat: Int,
+        rearRightSeatHeat: Int,
+        retriedAuth: Boolean = false
+    ): Result<Unit> {
+        return try {
+            val accessToken = getToken()
+            val pin = getServicePin()
+            val deviceId = preferencesManager.getOrCreateCanadaDeviceId()
+            val vehicleId = registrationId.ifBlank { vin }
+            val pAuth = getCanadaPinAuth(accessToken, vehicleId, pin, deviceId)
+
+            fun payload(useRemoteControl: Boolean) = canadaClimatePayload(
+                pin = pin,
+                tempF = tempF,
+                defrost = defrost,
+                durationMinutes = durationMinutes,
+                isEv = isEv,
+                useRemoteControl = useRemoteControl,
+                driverSeat = driverSeatHeat,
+                passengerSeat = passengerSeatHeat,
+                rearLeftSeat = rearLeftSeatHeat,
+                rearRightSeat = rearRightSeatHeat
+            )
+
+            if (!isEv) {
+                val response = getCanadaApiService().startEngine(
+                    accessToken, vehicleId, pAuth, deviceId, payload(useRemoteControl = false)
+                )
+                return when (val outcome = classifyCanadaCommandResponse(response.code(), readRawResponseBody(response), "Start")) {
+                    CanadaCommandOutcome.Ok -> Result.Success(Unit)
+                    is CanadaCommandOutcome.Failed -> Result.Error(outcome.message, outcome.code)
+                    is CanadaCommandOutcome.AuthFailed -> {
+                        val refreshedToken = canadaAccessTokenAfterAuthFailure(outcome.httpCode, outcome.json, retriedAuth)
+                        if (refreshedToken != null) {
+                            startCanadaClimate(
+                                vin, registrationId, tempF, defrost, durationMinutes, isEv,
+                                driverSeatHeat, passengerSeatHeat, rearLeftSeatHeat, rearRightSeatHeat,
+                                retriedAuth = true
+                            )
+                        } else {
+                            Result.Error("Session expired. Please sign in again.", outcome.httpCode)
+                        }
+                    }
+                }
+            }
+
+            // Prefer the payload key that worked last time for this vehicle (IONIQ 9 needs remoteControl).
+            // That avoids a failed probe call, which also triggers BlueLink's 90s command cooldown.
+            val preferRemoteControl = canadaEvUsesRemoteControl[vehicleId] == true
+            val firstRemote = preferRemoteControl
+            val firstResponse = getCanadaApiService().startEvClimate(
+                accessToken, vehicleId, pAuth, deviceId, payload(useRemoteControl = firstRemote)
+            )
+            val firstRaw = readRawResponseBody(firstResponse)
+            when (val firstOutcome = classifyCanadaCommandResponse(firstResponse.code(), firstRaw, "Start")) {
+                CanadaCommandOutcome.Ok -> {
+                    canadaEvUsesRemoteControl[vehicleId] = firstRemote
+                    rememberCanadaCommandCooldown(vehicleId)
+                    Result.Success(Unit)
+                }
+                is CanadaCommandOutcome.AuthFailed -> {
+                    val refreshedToken = canadaAccessTokenAfterAuthFailure(firstOutcome.httpCode, firstOutcome.json, retriedAuth)
+                    if (refreshedToken != null) {
+                        startCanadaClimate(
+                            vin, registrationId, tempF, defrost, durationMinutes, isEv,
+                            driverSeatHeat, passengerSeatHeat, rearLeftSeatHeat, rearRightSeatHeat,
+                            retriedAuth = true
+                        )
+                    } else {
+                        Result.Error("Session expired. Please sign in again.", firstOutcome.httpCode)
+                    }
+                }
+                is CanadaCommandOutcome.Failed -> {
+                    rememberCanadaCommandCooldown(vehicleId)
+                    val firstJson = runCatching {
+                        JsonParser.parseString(firstRaw).asJsonObject
+                    }.getOrNull()
+                    if (canadaErrorCode(firstJson) == "6533") {
+                        return Result.Error(canadaErrorMessage(firstJson, "Start failed"), firstOutcome.code)
+                    }
+                    val retryRemote = !firstRemote
+                    val retryResponse = getCanadaApiService().startEvClimate(
+                        accessToken, vehicleId, pAuth, deviceId, payload(useRemoteControl = retryRemote)
+                    )
+                    when (val retryOutcome = classifyCanadaCommandResponse(retryResponse.code(), readRawResponseBody(retryResponse), "Start")) {
+                        CanadaCommandOutcome.Ok -> {
+                            canadaEvUsesRemoteControl[vehicleId] = retryRemote
+                            rememberCanadaCommandCooldown(vehicleId)
+                            Result.Success(Unit)
+                        }
+                        is CanadaCommandOutcome.Failed -> {
+                            rememberCanadaCommandCooldown(vehicleId)
+                            val message = if (canadaErrorCode(firstJson) == "15109") {
+                                "Climate start failed: this vehicle needs the newer Canada climate format, " +
+                                    "and the fallback also failed (${retryOutcome.message})"
+                            } else {
+                                retryOutcome.message
+                            }
+                            Result.Error(message, retryOutcome.code)
+                        }
+                        is CanadaCommandOutcome.AuthFailed ->
+                            Result.Error("Session expired. Please sign in again.", retryOutcome.httpCode)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Start failed")
+        }
+    }
+
+
+    // ─── Europe CCSP helpers ───────────────────────────────────────────────────
+
+    private fun euErrorMessage(json: JsonObject?, fallback: String): String {
+        val retMsg = json?.stringOrNull("retMsg")
+        val resCode = json?.stringOrNull("resCode")
+        return when {
+            !retMsg.isNullOrBlank() && !resCode.isNullOrBlank() -> "$fallback ($resCode): $retMsg"
+            !retMsg.isNullOrBlank() -> retMsg
+            !resCode.isNullOrBlank() -> "$fallback ($resCode)"
+            else -> fallback
+        }
+    }
+
+    private fun euResponseFailed(json: JsonObject?): Boolean {
+        val retCode = json?.stringOrNull("retCode")
+        val resCode = json?.stringOrNull("resCode")
+        return retCode.equals("F", ignoreCase = true) || (!resCode.isNullOrBlank() && resCode != "0000")
+    }
+
+    private fun isLikelyAuthFailure(code: Int, json: JsonObject?): Boolean {
+        if (code == 401 || code == 403) return true
+        val message = listOfNotNull(
+            json?.stringOrNull("retMsg"),
+            json?.stringOrNull("message"),
+            json?.stringOrNull("error"),
+            json?.stringOrNull("error_description"),
+            json?.objectOrNull("error")?.stringOrNull("message"),
+            json?.objectOrNull("error")?.stringOrNull("error_description"),
+            json?.objectOrNull("error")?.stringOrNull("errorCode"),
+            json?.stringOrNull("resCode")
+        ).joinToString(" ").lowercase()
+        // Avoid bare "auth" — it matches unrelated feature/status strings and caused false logouts.
+        return message.contains("unauthorized") ||
+            message.contains("forbidden") ||
+            message.contains("invalid_token") ||
+            message.contains("invalid token") ||
+            message.contains("invalid access") ||
+            (message.contains("access token") && message.contains("expired")) ||
+            message.contains("token expired") ||
+            message.contains("token is expired") ||
+            message.contains("authentication failed") ||
+            message.contains("not authenticated") ||
+            message.contains("login required")
+    }
+
+    private fun euRandomHex(length: Int): String {
+        val random = SecureRandom()
+        val alphabet = "0123456789abcdef"
+        return buildString(length) {
+            repeat(length) {
+                append(alphabet[random.nextInt(alphabet.length)])
+            }
+        }
+    }
+
+    private fun looksLikeLegacyLocalEuDeviceId(deviceId: String): Boolean {
+        // v1.13 EU test builds generated a local UUID before registering with CCSP.
+        // CCSP accepts login tokens independently, but vehicle/status/control calls can fail
+        // with a locally invented device id. Force a one-time re-registration for that shape.
+        return Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+            .matches(deviceId.trim())
+    }
+
+    private suspend fun ensureEuropeDeviceRegistered(region: Region): String {
+        val stored = preferencesManager.getStoredEuDeviceId(region.name).orEmpty().trim()
+        if (stored.isNotBlank() && !looksLikeLegacyLocalEuDeviceId(stored)) {
+            return stored
+        }
+
+        val registrationClient = EuApiClient(region, "").apiService
+        val response = registrationClient.registerNotifications(
+            JsonObject().apply {
+                addProperty("pushRegId", euRandomHex(64))
+                addProperty("pushType", region.euPushType.ifBlank { "GCM" })
+                addProperty("uuid", java.util.UUID.randomUUID().toString())
+            }
+        )
+        val json = response.body()
+        if (!response.isSuccessful || euResponseFailed(json)) {
+            throw IllegalStateException(euErrorMessage(json, "European device registration failed (${response.code()})"))
+        }
+
+        val deviceId = json?.objectOrNull("resMsg")?.stringOrNull("deviceId")
+            ?: json?.objectOrNull("retValue")?.stringOrNull("deviceId")
+            ?: json?.stringOrNull("deviceId")
+            ?: throw IllegalStateException("European device registration did not return a deviceId")
+
+        preferencesManager.setEuDeviceId(deviceId, region.name)
+        euApiClient = null
+        euApiClientRegion = null
+        euApiClientDeviceId = null
+        return deviceId
+    }
+
+    private suspend fun registeredEuropeDeviceId(): String = ensureEuropeDeviceRegistered(currentRegion())
+
+    private fun normalizeBearerlessToken(token: String): String = token
+        .trim()
+        .removePrefix("Bearer ")
+        .removePrefix("bearer ")
+        .trim()
+
+    private suspend fun loginEurope(username: String, refreshToken: String, servicePin: String): Result<Unit> {
+        val token = refreshToken.trim()
+        if (!Regex("^[A-Z0-9]{48}$").matches(token)) {
+            return Result.Error(
+                "Europe login requires a 48-character Hyundai/Kia Connect refresh token, not the normal account password. Generate the EU refresh token with a browser/token helper, paste it into the password field, then sign in again."
+            )
+        }
+
+        return try {
+            val region = currentRegion()
+            ensureEuropeDeviceRegistered(region)
+
+            val response = if (region == Region.EU_GENESIS || region.euIdentityBaseUrl.isBlank()) {
+                getEuApiService().refreshAccessToken(
+                    authorization = region.euBasicAuthorization,
+                    refreshToken = token
+                )
+            } else {
+                getEuIdentityApiService().refreshAccessToken(
+                    refreshToken = token,
+                    clientId = region.euServiceId,
+                    clientSecret = region.euClientSecret
+                )
+            }
+
+            val json = response.body()
+            if (!response.isSuccessful || euResponseFailed(json)) {
+                return Result.Error(euErrorMessage(json, "Europe refresh-token login failed (${response.code()})"), response.code())
+            }
+
+            val accessToken = json?.stringOrNull("access_token")
+                ?: json?.objectOrNull("retValue")?.stringOrNull("access_token")
+                ?: return Result.Error("Europe login did not return an access token")
+            val nextRefreshToken = json?.stringOrNull("refresh_token")
+                ?: json?.objectOrNull("retValue")?.stringOrNull("refresh_token")
+                ?: token
+            val expiresIn = json?.intOrNull("expires_in")
+                ?: json?.objectOrNull("retValue")?.intOrNull("expires_in")
+                ?: 1800
+
+            preferencesManager.saveSession(
+                accessToken = normalizeBearerlessToken(accessToken),
+                refreshToken = normalizeBearerlessToken(nextRefreshToken),
+                username = username.ifBlank { "EU user" },
+                expiresIn = expiresIn.coerceAtLeast(60) - 60,
+                servicePin = servicePin
+            )
+            Result.Success(Unit)
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Europe login network error")
+        }
+    }
+
+    private suspend fun getEuropeVehicles(): Result<List<Vehicle>> {
+        return try {
+            var response = getEuApiService().getVehicles(bearerToken())
+            var json = response.body()
+            if (!response.isSuccessful || euResponseFailed(json)) {
+                if (isLikelyAuthFailure(response.code(), json)) {
+                    val refreshToken = preferencesManager.refreshToken.first().orEmpty()
+                    if (refreshToken.isNotBlank()) {
+                        val refreshOutcome = runCatching { refreshEuropeAccessToken(refreshToken) }
+                        val refreshedToken = refreshOutcome.getOrNull()
+                        if (!refreshedToken.isNullOrBlank()) {
+                            response = getEuApiService().getVehicles("Bearer $refreshedToken")
+                            json = response.body()
+                        } else {
+                            val refreshError = refreshOutcome.exceptionOrNull()
+                            if (refreshError != null && !isHardAuthRefreshFailure(refreshError)) {
+                                return Result.Error(
+                                    refreshError.message ?: "Could not refresh session. Try again.",
+                                    response.code()
+                                )
+                            }
+                            preferencesManager.clearSession(requirePassword = true)
+                            return Result.Error("Session expired. Please sign in again.", response.code())
+                        }
+                    }
+                }
+                if (!response.isSuccessful || euResponseFailed(json)) {
+                    if (isLikelyAuthFailure(response.code(), json)) {
+                        preferencesManager.clearSession(requirePassword = true)
+                        return Result.Error("Session expired. Please sign in again.", response.code())
+                    }
+                    return Result.Error(euErrorMessage(json, "Failed to fetch European vehicles (${response.code()})"), response.code())
+                }
+            }
+            val region = currentRegion()
+            val brand = when (region) {
+                Region.EU_KIA -> "K"
+                Region.EU_GENESIS -> "G"
+                else -> "H"
+            }
+            val source = json?.get("resMsg") ?: json?.get("retValue") ?: json
+            val array = when {
+                source == null || source.isJsonNull -> null
+                source.isJsonArray -> source.asJsonArray
+                source.isJsonObject -> source.asJsonObject.arrayOrNull("vehicles")
+                    ?: source.asJsonObject.arrayOrNull("vehicleList")
+                    ?: source.asJsonObject.arrayOrNull("enrolledVehicleDetails")
+                else -> null
+            }
+            val vehicles = array?.mapNotNull { it.takeIfJsonObject() }?.map { entry ->
+                val vehicleObj = entry.objectOrNull("vehicle") ?: entry.objectOrNull("vehicleDetails") ?: entry
+                val vehicleId = vehicleObj.stringOrNull("id")
+                    ?: vehicleObj.stringOrNull("vehicleId")
+                    ?: vehicleObj.stringOrNull("vehicleIdentifier")
+                    ?: vehicleObj.stringOrNull("regid")
+                    ?: vehicleObj.stringOrNull("enrollmentId")
+                    ?: vehicleObj.stringOrNull("vin")
+                    ?: ""
+                val vin = vehicleObj.stringOrNull("vin").orEmpty()
+                val modelName = vehicleObj.stringOrNull("name")
+                    ?: vehicleObj.stringOrNull("modelName")
+                    ?: vehicleObj.stringOrNull("series")
+                    ?: vehicleObj.stringOrNull("model")
+                    ?: "Vehicle"
+                Vehicle(
+                    vin = vin,
+                    vehicleIdentifier = vehicleId,
+                    enrollmentId = vehicleId,
+                    regId = vehicleId,
+                    generation = if ((vehicleObj.intOrNull("ccuCCS2ProtocolSupport") ?: 0) != 0) "4" else "3",
+                    nickname = vehicleObj.stringOrNull("nickname")
+                        ?: vehicleObj.stringOrNull("nickName")
+                        ?: vehicleObj.stringOrNull("vehicleName")
+                        ?: "",
+                    modelCode = vehicleObj.stringOrNull("modelCode") ?: modelName,
+                    modelName = modelName,
+                    modelYear = vehicleObj.stringOrNull("modelYear") ?: vehicleObj.stringOrNull("year") ?: "",
+                    brandIndicator = brand,
+                    odometer = vehicleObj.intOrNull("odometer") ?: 0
+                )
+            }.orEmpty()
+            Result.Success(vehicles)
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Europe vehicle list network error")
+        }
+    }
+
+    private suspend fun resolveEuropeVehicleId(vin: String, registrationId: String): String {
+        if (registrationId.isNotBlank()) return registrationId
+        return when (val result = getEuropeVehicles()) {
+            is Result.Success -> result.data.firstOrNull { it.vin == vin }?.regId ?: vin
+            is Result.Error -> vin
+        }
+    }
+
+    private suspend fun getEuropeVehicleStatus(vin: String, forceRefresh: Boolean, registrationId: String, generation: String): Result<VehicleStatusData> {
+        return try {
+            val vehicleId = resolveEuropeVehicleId(vin, registrationId)
+            val api = getEuApiService()
+            val ccs2First = generation == "4"
+
+            suspend fun fetchStatus(authorization: String): Pair<retrofit2.Response<JsonObject>, JsonObject?> {
+                val primary = if (ccs2First) {
+                    if (forceRefresh) api.getLiveCcs2VehicleStatus(authorization, vehicleId)
+                    else api.getCachedCcs2VehicleStatus(authorization, vehicleId)
+                } else {
+                    if (forceRefresh) api.getLiveVehicleStatus(authorization, vehicleId)
+                    else api.getCachedVehicleStatus(authorization, vehicleId)
+                }
+                val fallback = if (!primary.isSuccessful && ccs2First) {
+                    if (forceRefresh) api.getLiveVehicleStatus(authorization, vehicleId)
+                    else api.getCachedVehicleStatus(authorization, vehicleId)
+                } else primary
+                return fallback to fallback.body()
+            }
+
+            fun parseStatus(json: JsonObject?): Result<VehicleStatusData> {
+                val resMsg = json?.get("resMsg")
+                val status = when {
+                    resMsg == null || resMsg.isJsonNull -> json
+                    resMsg.isJsonObject && resMsg.asJsonObject.objectOrNull("vehicleStatusInfo") != null ->
+                        resMsg.asJsonObject.objectOrNull("vehicleStatusInfo")
+                    resMsg.isJsonObject && resMsg.asJsonObject.objectOrNull("state")?.objectOrNull("Vehicle") != null ->
+                        resMsg.asJsonObject.objectOrNull("state")?.objectOrNull("Vehicle")
+                    resMsg.isJsonObject -> resMsg.asJsonObject
+                    else -> json
+                } ?: return Result.Error("Could not parse European vehicle status")
+                val data = gson.fromJson(normalizeEuropeDistanceUnits(status), VehicleStatusData::class.java)
+                return Result.Success(data)
+            }
+
+            var (fallbackResponse, json) = fetchStatus(bearerToken())
+            if (!fallbackResponse.isSuccessful || euResponseFailed(json)) {
+                if (isLikelyAuthFailure(fallbackResponse.code(), json)) {
+                    val refreshToken = preferencesManager.refreshToken.first().orEmpty()
+                    if (refreshToken.isNotBlank()) {
+                        val refreshOutcome = runCatching { refreshEuropeAccessToken(refreshToken) }
+                        val refreshedToken = refreshOutcome.getOrNull()
+                        if (!refreshedToken.isNullOrBlank()) {
+                            val retry = fetchStatus("Bearer $refreshedToken")
+                            fallbackResponse = retry.first
+                            json = retry.second
+                            if (fallbackResponse.isSuccessful && !euResponseFailed(json)) {
+                                val parsed = parseStatus(json)
+                                if (parsed is Result.Success) {
+                                    preferencesManager.setLastStatusRefresh(System.currentTimeMillis())
+                                }
+                                return parsed
+                            }
+                        } else {
+                            val refreshError = refreshOutcome.exceptionOrNull()
+                            if (refreshError != null && !isHardAuthRefreshFailure(refreshError)) {
+                                return Result.Error(
+                                    refreshError.message ?: "Could not refresh session. Try again.",
+                                    fallbackResponse.code()
+                                )
+                            }
+                            preferencesManager.clearSession(requirePassword = true)
+                            return Result.Error("Session expired. Please sign in again.", fallbackResponse.code())
+                        }
+                    }
+                    if (isLikelyAuthFailure(fallbackResponse.code(), json)) {
+                        preferencesManager.clearSession(requirePassword = true)
+                        return Result.Error("Session expired. Please sign in again.", fallbackResponse.code())
+                    }
+                }
+                return Result.Error(
+                    euErrorMessage(json, "European status fetch failed (${fallbackResponse.code()})"),
+                    fallbackResponse.code()
+                )
+            }
+            val parsed = parseStatus(json)
+            if (parsed is Result.Success) {
+                preferencesManager.setLastStatusRefresh(System.currentTimeMillis())
+            }
+            parsed
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Europe status network error")
+        }
+    }
+
+    private suspend fun getEuropeControlAuthorization(vehicleId: String): String {
+        val pin = getServicePin(required = false)
+        if (pin.isBlank()) return bearerToken()
+
+        val region = currentRegion()
+        val deviceId = ensureEuropeDeviceRegistered(region)
+        val response = getEuApiService().verifyPin(
+            authorization = bearerToken(),
+            body = mapOf("deviceId" to deviceId, "pin" to pin, "vehicleId" to vehicleId)
+        )
+        val json = response.body()
+        if (!response.isSuccessful || euResponseFailed(json)) {
+            throw IllegalStateException(euErrorMessage(json, "European PIN verification failed (${response.code()})"))
+        }
+        val controlToken = json?.stringOrNull("controlToken")
+            ?: json?.objectOrNull("resMsg")?.stringOrNull("controlToken")
+            ?: json?.objectOrNull("retValue")?.stringOrNull("controlToken")
+            ?: return bearerToken()
+        return "Bearer $controlToken"
+    }
+
+    private suspend fun runEuropeCommand(
+        vin: String,
+        registrationId: String,
+        actionName: String,
+        call: suspend (authorization: String, vehicleId: String) -> retrofit2.Response<ResponseBody>
+    ): Result<Unit> {
+        return try {
+            val vehicleId = resolveEuropeVehicleId(vin, registrationId)
+            val authorization = getEuropeControlAuthorization(vehicleId)
+            validateRawCommandResponse(call(authorization, vehicleId), actionName)
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "$actionName failed")
+        }
+    }
+
+    private fun europeEnginePayload(action: String, deviceId: String, tempF: String = "72", defrost: Boolean = false, durationMinutes: Int = 10): JsonObject {
+        val celsius = (((tempF.toDoubleOrNull() ?: 72.0) - 32.0) * 5.0 / 9.0).coerceIn(14.0, 29.5)
+        return JsonObject().apply {
+            addProperty("action", action)
+            addProperty("deviceId", deviceId)
+            addProperty("igniOnDuration", durationMinutes)
+            add("airTemp", JsonObject().apply {
+                addProperty("value", celsius)
+                addProperty("unit", 0)
+            })
+            addProperty("defrost", defrost)
+            addProperty("airCtrl", action == "start")
+        }
+    }
+
+
+    // ─── Australia / New Zealand CCSP helpers ─────────────────────────────────
+
+    private fun auErrorMessage(json: JsonObject?, fallback: String): String {
+        val retMsg = json?.stringOrNull("retMsg")
+            ?: json?.stringOrNull("msg")
+            ?: json?.objectOrNull("error")?.stringOrNull("message")
+            ?: json?.objectOrNull("error")?.stringOrNull("error_description")
+        val resCode = json?.stringOrNull("resCode") ?: json?.stringOrNull("code")
+        return when {
+            !retMsg.isNullOrBlank() && !resCode.isNullOrBlank() -> "$fallback ($resCode): $retMsg"
+            !retMsg.isNullOrBlank() -> retMsg
+            !resCode.isNullOrBlank() -> "$fallback ($resCode)"
+            else -> fallback
+        }
+    }
+
+    private fun auResponseFailed(json: JsonObject?): Boolean {
+        val retCode = json?.stringOrNull("retCode")
+        val resCode = json?.stringOrNull("resCode")
+        return retCode.equals("F", ignoreCase = true) || (!resCode.isNullOrBlank() && resCode != "0000")
+    }
+
+    private suspend fun auAuthorization(): String = "Bearer ${getToken()}"
+
+    private fun extractQueryParam(url: String, name: String): String? {
+        val query = url.substringAfter('?', missingDelimiterValue = "")
+        if (query.isBlank()) return null
+        return query.split('&')
+            .mapNotNull { part ->
+                val pieces = part.split('=', limit = 2)
+                if (pieces.size == 2) pieces[0] to java.net.URLDecoder.decode(pieces[1], "UTF-8") else null
+            }
+            .firstOrNull { it.first == name }
+            ?.second
+    }
+
+    private suspend fun registerAuDeviceIfPossible(): String {
+        val api = getAuApiService()
+        val stamp = AuApiClient(currentRegion(), preferencesManager.getOrCreateAuDeviceId()).stamp()
+        val body = JsonObject().apply {
+            addProperty("pushRegId", com.bluedeck.data.api.newAuPushRegistrationId())
+            addProperty("pushType", "GCM")
+            addProperty("uuid", com.bluedeck.data.api.newAuUuid())
+        }
+        val response = api.registerNotifications(stamp, body)
+        val json = response.body()
+        val deviceId = json?.objectOrNull("resMsg")?.stringOrNull("deviceId")
+            ?: json?.objectOrNull("retValue")?.stringOrNull("deviceId")
+        if (response.isSuccessful && !deviceId.isNullOrBlank()) {
+            preferencesManager.setAuDeviceId(deviceId)
+            auApiClient = null
+            auApiClientDeviceId = null
+            return deviceId
+        }
+        return preferencesManager.getOrCreateAuDeviceId()
+    }
+
+    private suspend fun loginAustralia(username: String, password: String, servicePin: String): Result<Unit> {
+        return try {
+            val region = currentRegion()
+            getAuApiService().getAuthorizationCookies(
+                clientId = region.auServiceId,
+                redirectUri = "https://${region.auHost}/api/v1/user/oauth2/redirect"
+            )
+            registerAuDeviceIfPossible()
+            val signInResponse = getAuApiService().signIn(JsonObject().apply {
+                addProperty("email", username)
+                addProperty("password", password)
+            })
+            val signInJson = signInResponse.body()
+            if (!signInResponse.isSuccessful || auResponseFailed(signInJson)) {
+                return Result.Error(auErrorMessage(signInJson, "Australia login failed (${signInResponse.code()})"), signInResponse.code())
+            }
+            val redirectUrl = signInJson?.stringOrNull("redirectUrl")
+                ?: signInJson?.objectOrNull("resMsg")?.stringOrNull("redirectUrl")
+                ?: return Result.Error("Australia login did not return an authorization redirect")
+            val authorizationCode = extractQueryParam(redirectUrl, "code")
+                ?: return Result.Error("Australia login redirect did not contain an authorization code")
+            val stamp = AuApiClient(region, preferencesManager.getOrCreateAuDeviceId()).stamp()
+            val tokenResponse = getAuApiService().exchangeAuthorizationCode(
+                authorization = region.auBasicAuthorization,
+                stamp = stamp,
+                redirectUri = "https://${region.auHost}/api/v1/user/oauth2/redirect",
+                code = authorizationCode
+            )
+            val tokenJson = tokenResponse.body()
+            if (!tokenResponse.isSuccessful || auResponseFailed(tokenJson)) {
+                return Result.Error(auErrorMessage(tokenJson, "Australia token exchange failed (${tokenResponse.code()})"), tokenResponse.code())
+            }
+            val accessToken = tokenJson?.stringOrNull("access_token")
+                ?: tokenJson?.objectOrNull("retValue")?.stringOrNull("access_token")
+                ?: return Result.Error("Australia login did not return an access token")
+            val refreshToken = tokenJson?.stringOrNull("refresh_token")
+                ?: tokenJson?.objectOrNull("retValue")?.stringOrNull("refresh_token")
+                ?: ""
+            val expiresIn = tokenJson?.intOrNull("expires_in")
+                ?: tokenJson?.objectOrNull("retValue")?.intOrNull("expires_in")
+                ?: 82800
+            preferencesManager.saveSession(
+                accessToken = accessToken,
+                refreshToken = refreshToken,
+                username = username,
+                expiresIn = expiresIn.coerceAtLeast(60) - 60,
+                servicePin = servicePin
+            )
+            Result.Success(Unit)
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Australia login network error")
+        }
+    }
+
+    private suspend fun getAustraliaVehicles(): Result<List<Vehicle>> {
+        return try {
+            val response = getAuApiService().getVehicles(auAuthorization())
+            val json = response.body()
+            if (!response.isSuccessful || auResponseFailed(json)) {
+                return Result.Error(auErrorMessage(json, "Failed to fetch Australia/NZ vehicles (${response.code()})"), response.code())
+            }
+            val region = currentRegion()
+            val brand = when (region) {
+                Region.AU_KIA, Region.NZ_KIA -> "K"
+                else -> "H"
+            }
+            val source = json?.get("resMsg") ?: json?.get("retValue") ?: json
+            val array = when {
+                source == null || source.isJsonNull -> null
+                source.isJsonArray -> source.asJsonArray
+                source.isJsonObject -> source.asJsonObject.arrayOrNull("vehicles")
+                    ?: source.asJsonObject.arrayOrNull("vehicleList")
+                    ?: source.asJsonObject.arrayOrNull("enrolledVehicleDetails")
+                else -> null
+            }
+            val vehicles = array?.mapNotNull { it.takeIfJsonObject() }?.map { entry ->
+                val vehicleObj = entry.objectOrNull("vehicle") ?: entry.objectOrNull("vehicleDetails") ?: entry
+                val vehicleId = vehicleObj.stringOrNull("id")
+                    ?: vehicleObj.stringOrNull("vehicleId")
+                    ?: vehicleObj.stringOrNull("vehicleIdentifier")
+                    ?: vehicleObj.stringOrNull("regid")
+                    ?: vehicleObj.stringOrNull("enrollmentId")
+                    ?: vehicleObj.stringOrNull("vin")
+                    ?: ""
+                val vin = vehicleObj.stringOrNull("vin").orEmpty()
+                val modelName = vehicleObj.stringOrNull("name")
+                    ?: vehicleObj.stringOrNull("modelName")
+                    ?: vehicleObj.stringOrNull("series")
+                    ?: vehicleObj.stringOrNull("model")
+                    ?: "Vehicle"
+                Vehicle(
+                    vin = vin,
+                    vehicleIdentifier = vehicleId,
+                    enrollmentId = vehicleId,
+                    regId = vehicleId,
+                    generation = if ((vehicleObj.intOrNull("ccuCCS2ProtocolSupport") ?: 0) != 0) "4" else "3",
+                    nickname = vehicleObj.stringOrNull("nickname")
+                        ?: vehicleObj.stringOrNull("nickName")
+                        ?: vehicleObj.stringOrNull("vehicleName")
+                        ?: "",
+                    modelCode = vehicleObj.stringOrNull("modelCode") ?: modelName,
+                    modelName = modelName,
+                    modelYear = vehicleObj.stringOrNull("modelYear") ?: vehicleObj.stringOrNull("year") ?: "",
+                    brandIndicator = brand,
+                    odometer = vehicleObj.intOrNull("odometer") ?: 0
+                )
+            }.orEmpty()
+            Result.Success(vehicles)
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Australia/NZ vehicle list network error")
+        }
+    }
+
+    private suspend fun resolveAustraliaVehicleId(vin: String, registrationId: String): String {
+        if (registrationId.isNotBlank()) return registrationId
+        return when (val result = getAustraliaVehicles()) {
+            is Result.Success -> result.data.firstOrNull { it.vin == vin }?.regId ?: vin
+            is Result.Error -> vin
+        }
+    }
+
+    private suspend fun getAustraliaVehicleStatus(vin: String, forceRefresh: Boolean, registrationId: String, generation: String): Result<VehicleStatusData> {
+        return try {
+            val vehicleId = resolveAustraliaVehicleId(vin, registrationId)
+            val api = getAuApiService()
+            val ccs2First = generation == "4"
+            val response = if (ccs2First) {
+                if (forceRefresh) api.getLiveCcs2VehicleStatus(auAuthorization(), vehicleId) else api.getCachedCcs2VehicleStatus(auAuthorization(), vehicleId)
+            } else {
+                if (forceRefresh) api.getLiveVehicleStatus(auAuthorization(), vehicleId) else api.getCachedVehicleStatus(auAuthorization(), vehicleId)
+            }
+            val fallbackResponse = if (!response.isSuccessful && ccs2First) {
+                if (forceRefresh) api.getLiveVehicleStatus(auAuthorization(), vehicleId) else api.getCachedVehicleStatus(auAuthorization(), vehicleId)
+            } else response
+            val json = fallbackResponse.body()
+            if (!fallbackResponse.isSuccessful || auResponseFailed(json)) {
+                return Result.Error(auErrorMessage(json, "Australia/NZ status fetch failed (${fallbackResponse.code()})"), fallbackResponse.code())
+            }
+            val resMsg = json?.get("resMsg")
+            val status = when {
+                resMsg == null || resMsg.isJsonNull -> json
+                resMsg.isJsonObject && resMsg.asJsonObject.objectOrNull("vehicleStatusInfo") != null -> resMsg.asJsonObject.objectOrNull("vehicleStatusInfo")
+                resMsg.isJsonObject && resMsg.asJsonObject.objectOrNull("state")?.objectOrNull("Vehicle") != null -> resMsg.asJsonObject.objectOrNull("state")?.objectOrNull("Vehicle")
+                resMsg.isJsonObject -> resMsg.asJsonObject
+                else -> json
+            } ?: return Result.Error("Could not parse Australia/NZ vehicle status")
+            val data = gson.fromJson(status, VehicleStatusData::class.java)
+            preferencesManager.setLastStatusRefresh(System.currentTimeMillis())
+            Result.Success(data)
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Australia/NZ status network error")
+        }
+    }
+
+    private suspend fun runAustraliaCommand(
+        vin: String,
+        registrationId: String,
+        actionName: String,
+        call: suspend (authorization: String, vehicleId: String) -> retrofit2.Response<ResponseBody>
+    ): Result<Unit> {
+        return try {
+            val vehicleId = resolveAustraliaVehicleId(vin, registrationId)
+            validateRawCommandResponse(call(auAuthorization(), vehicleId), actionName)
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "$actionName failed")
+        }
+    }
+
+    private suspend fun australiaDeviceId(): String = preferencesManager.getOrCreateAuDeviceId()
+
+    private fun australiaEnginePayload(action: String, tempF: String = "72", defrost: Boolean = false, durationMinutes: Int = 10): JsonObject {
+        val celsius = (((tempF.toDoubleOrNull() ?: 72.0) - 32.0) * 5.0 / 9.0).coerceIn(17.0, 26.5)
+        return JsonObject().apply {
+            addProperty("action", action)
+            addProperty("deviceId", auApiClientDeviceId.orEmpty())
+            addProperty("igniOnDuration", durationMinutes)
+            add("airTemp", JsonObject().apply {
+                addProperty("value", celsius)
+                addProperty("unit", 0)
+            })
+            addProperty("defrost", defrost)
+            addProperty("airCtrl", action == "start")
+        }
+    }
+
+
+    // ─── USA Kia helpers ───────────────────────────────────────────────────────
+
+    private suspend fun kiaUsLoginBody(username: String, password: String, includeTnc: Boolean = true): JsonObject = JsonObject().apply {
+        addProperty("deviceKey", kiaUsDeviceId())
+        addProperty("deviceType", 2)
+        add("userCredential", JsonObject().apply {
+            addProperty("userId", username)
+            addProperty("password", password)
+        })
+        if (includeTnc) addProperty("tncFlag", 1)
+    }
+
+    private fun retrofit2.Response<*>.headerAny(name: String): String? =
+        headers().get(name) ?: headers().get(name.lowercase()) ?: headers().get(name.uppercase())
+
+    private fun kiaUsStatusFailed(json: JsonObject?): Boolean {
+        val status = json?.objectOrNull("status") ?: return false
+        val statusCode = status.intOrNull("statusCode") ?: return false
+        return statusCode != 0
+    }
+
+    private fun kiaUsErrorMessage(json: JsonObject?, fallback: String): String {
+        val status = json?.objectOrNull("status")
+        return status?.stringOrNull("errorMessage")
+            ?: status?.stringOrNull("message")
+            ?: json?.stringOrNull("errorMessage")
+            ?: json?.stringOrNull("message")
+            ?: fallback
+    }
+
+    private fun JsonObject.childObject(path: String): JsonObject? {
+        var current: JsonObject = this
+        path.split('.').forEach { part ->
+            current = current.objectOrNull(part) ?: return null
+        }
+        return current
+    }
+
+    private fun JsonObject.childArray(path: String): JsonArray? {
+        val segments = path.split('.')
+        var current: JsonObject = this
+        segments.dropLast(1).forEach { part ->
+            current = current.objectOrNull(part) ?: return null
+        }
+        return current.arrayOrNull(segments.last())
+    }
+
+    private fun JsonObject.childString(path: String): String? {
+        val segments = path.split('.')
+        var current: JsonObject = this
+        segments.dropLast(1).forEach { part ->
+            current = current.objectOrNull(part) ?: return null
+        }
+        return current.stringOrNull(segments.last())
+    }
+
+    private fun JsonObject.childInt(path: String): Int? {
+        val segments = path.split('.')
+        var current: JsonObject = this
+        segments.dropLast(1).forEach { part ->
+            current = current.objectOrNull(part) ?: return null
+        }
+        return current.intOrNull(segments.last())
+    }
+
+    private fun JsonElement?.asKiaJsonObjectOrNull(): JsonObject? =
+        if (this != null && !isJsonNull && isJsonObject) asJsonObject else null
+
+    private fun JsonElement?.asKiaJsonArrayOrNull(): JsonArray? =
+        if (this != null && !isJsonNull && isJsonArray) asJsonArray else null
+
+    private fun JsonElement?.asKiaBooleanOrNull(): Boolean? {
+        val element = this ?: return null
+        if (element.isJsonNull) return null
+        return runCatching { element.asBoolean }.getOrNull()
+            ?: runCatching { element.asInt != 0 }.getOrNull()
+            ?: runCatching { element.asString.equals("true", ignoreCase = true) || element.asString == "1" }.getOrNull()
+    }
+
+    private fun JsonElement?.asKiaNumberOrNull(): Number? {
+        val element = this ?: return null
+        if (element.isJsonNull) return null
+        return runCatching { element.asNumber }.getOrNull()
+            ?: runCatching { element.asString.toDouble() }.getOrNull()
+    }
+
+    private fun extractSeatConfigurations(source: JsonObject): SeatConfigurations? {
+        val directArrays = listOfNotNull(
+            source.childArray("vehicleConfig.vehicleDetail.seatConfigurations.seatConfigs"),
+            source.childArray("vehicleConfig.vehicleDetail.vehicle.seatConfigurations.seatConfigs"),
+            source.childArray("vehicleConfig.seatConfigurations.seatConfigs"),
+            source.childArray("vehicleDetails.seatConfigurations.seatConfigs"),
+            source.childArray("vehicleDetail.seatConfigurations.seatConfigs"),
+            source.childArray("seatConfigurations.seatConfigs"),
+            source.arrayOrNull("seatConfigs"),
+            source.arrayOrNull("seatConfig")
+        )
+
+        val parsed = directArrays
+            .asSequence()
+            .flatMap { it.asSequence() }
+            .mapNotNull { it.asKiaJsonObjectOrNull() }
+            .mapIndexed { index, seat ->
+                SeatConfig(
+                    seatLocationId = seat.stringOrNull("seatLocationID")
+                        ?: seat.stringOrNull("seatLocationId")
+                        ?: seat.stringOrNull("seatLocation")
+                        ?: seat.stringOrNull("location")
+                        ?: (index + 1).toString(),
+                    heatingCapable = seat.readCapabilityFlag(
+                        "heatingCapable",
+                        "heatCapable",
+                        "heaterCapable",
+                        "heatSupported",
+                        "heatingSupported"
+                    ),
+                    ventCapable = seat.readCapabilityFlag(
+                        "ventCapable",
+                        "ventilationCapable",
+                        "ventSupported",
+                        "coolingCapable"
+                    ),
+                    supportedLevels = seat.stringOrNull("supportedLevels")
+                        ?: seat.stringOrNull("supportLevels")
+                        ?: seat.stringOrNull("levels")
+                        ?: ""
+                )
+            }
+            .filter { it.seatLocationId.isNotBlank() }
+            .distinctBy { it.seatLocationId.normalizeSeatIdForExtraction() }
+            .toList()
+
+        return parsed.takeIf { it.isNotEmpty() }?.let { SeatConfigurations(it) }
+    }
+
+    private fun JsonObject.readCapabilityFlag(vararg names: String): String {
+        for (name in names) {
+            val value = get(name) ?: continue
+            if (value.isJsonNull) continue
+            value.asKiaBooleanOrNull()?.let { return if (it) "Y" else "N" }
+            runCatching { value.asNumber }.getOrNull()?.let { return if (it.toInt() != 0) "Y" else "N" }
+            runCatching { value.asString }.getOrNull()?.takeIf { it.isNotBlank() }?.let { return it }
+        }
+        return ""
+    }
+
+    private fun String.normalizeSeatIdForExtraction(): String = trim()
+        .uppercase()
+        .replace('-', '_')
+        .replace(' ', '_')
+
+    private fun enrollmentEntryForVin(enrollment: JsonObject, vin: String): JsonObject? {
+        val normalizedVin = vin.trim()
+        if (normalizedVin.isEmpty()) return null
+        val details = enrollment.arrayOrNull("enrolledVehicleDetails") ?: return null
+        return details.asSequence()
+            .mapNotNull { it.asKiaJsonObjectOrNull() }
+            .firstOrNull { entry ->
+                val vehicle = entry.objectOrNull("vehicleDetails") ?: entry.objectOrNull("vehicle")
+                vehicle?.stringOrNull("vin")?.equals(normalizedVin, ignoreCase = true) == true
+            }
+    }
+
+    private fun extractSeatConfigurationsFromEnrollment(entry: JsonObject): SeatConfigurations? =
+        extractSeatConfigurations(entry)
+            ?: entry.objectOrNull("vehicleDetails")?.let { extractSeatConfigurations(it) }
+            ?: entry.objectOrNull("vehicle")?.let { extractSeatConfigurations(it) }
+
+    private fun normalizeKiaUsStatus(status: JsonObject): JsonObject {
+        val normalized = status.deepCopy()
+
+        normalized.objectOrNull("climate")?.let { climate ->
+            climate.get("airCtrl")?.let { normalized.add("airCtrlOn", it.deepCopy()) }
+            climate.get("airTemp")?.asKiaJsonObjectOrNull()?.let { airTemp ->
+                val normalizedTemp = airTemp.deepCopy()
+                val rawValue = normalizedTemp.stringOrNull("value")
+                if (rawValue.equals("LOW", ignoreCase = true)) normalizedTemp.addProperty("value", "62")
+                if (rawValue.equals("HIGH", ignoreCase = true)) normalizedTemp.addProperty("value", "82")
+                // Kia USA's airTemp unit code 1 is Fahrenheit. Keeping the unit explicit
+                // prevents 72°F from being interpreted as 72°C and displayed as 162°F.
+                if (!normalizedTemp.has("unit")) normalizedTemp.addProperty("unit", 1)
+                normalized.add("airTemp", normalizedTemp)
+            }
+            climate.get("defrost")?.let { normalized.add("defrost", it.deepCopy()) }
+            climate.objectOrNull("heatingAccessory")?.let { heat ->
+                heat.get("steeringWheel")?.let { normalized.add("steerWheelHeat", it.deepCopy()) }
+                heat.get("rearWindow")?.let { normalized.add("sideBackWindowHeat", it.deepCopy()) }
+            }
+        }
+
+        normalized.objectOrNull("evStatus")?.let { evStatus ->
+            val targetSoc = evStatus.arrayOrNull("targetSOC") ?: evStatus.arrayOrNull("targetSOClist")
+            if (targetSoc != null && evStatus.objectOrNull("reservChargeInfos") == null) {
+                evStatus.add("reservChargeInfos", JsonObject().apply {
+                    add("targetSOClist", targetSoc.deepCopy())
+                })
+            }
+        }
+
+        normalized.objectOrNull("doorStatus")?.let { doors ->
+            JsonObject().also { doorOpen ->
+                listOf("frontLeft", "frontRight", "backLeft", "backRight").forEach { key ->
+                    doors.get(key)?.let { doorOpen.add(key, it.deepCopy()) }
+                }
+                normalized.add("doorOpen", doorOpen)
+            }
+            doors.get("trunk")?.asKiaBooleanOrNull()?.let { normalized.addProperty("trunkOpen", it) }
+            doors.get("hood")?.asKiaBooleanOrNull()?.let { normalized.addProperty("hoodOpen", it) }
+        }
+
+        normalized.objectOrNull("batteryStatus")?.let { batteryStatus ->
+            JsonObject().also { battery ->
+                batteryStatus.get("stateOfCharge")?.asKiaNumberOrNull()?.let { battery.addProperty("batSoc", it) }
+                batteryStatus.get("powerAutoCutMode")?.asKiaNumberOrNull()?.let { battery.addProperty("powerAutoCutMode", it) }
+                batteryStatus.get("warning")?.asKiaNumberOrNull()?.let { warning ->
+                    battery.add("batSignalReferenceValue", JsonObject().apply { addProperty("batWarning", warning) })
+                }
+                normalized.add("battery", battery)
+            }
+        }
+
+        normalized.objectOrNull("distanceToEmpty")?.let { distance ->
+            JsonObject().also { dte ->
+                distance.get("value")?.asKiaNumberOrNull()?.let { dte.addProperty("value", it) }
+                distance.get("unit")?.asKiaNumberOrNull()?.let { dte.addProperty("unit", it) }
+                normalized.add("dte", dte)
+            }
+        }
+
+        normalized.objectOrNull("windowStatus")?.let { windows ->
+            normalized.add("windowOpen", JsonObject().apply {
+                windows.get("windowFL")?.let { add("frontLeft", it.deepCopy()) }
+                windows.get("windowFR")?.let { add("frontRight", it.deepCopy()) }
+                windows.get("windowRL")?.let { add("backLeft", it.deepCopy()) }
+                windows.get("windowRR")?.let { add("backRight", it.deepCopy()) }
+            })
+        }
+
+        return normalized
+    }
+
+    private fun kiaUsVehicleInfoEntry(json: JsonObject?): JsonObject? =
+        json
+            ?.objectOrNull("payload")
+            ?.arrayOrNull("vehicleInfoList")
+            ?.firstOrNull()
+            ?.asKiaJsonObjectOrNull()
+
+    private fun kiaUsCachedStatusPayload(json: JsonObject?): JsonObject? =
+        kiaUsVehicleInfoEntry(json)?.childObject("lastVehicleInfo.vehicleStatusRpt.vehicleStatus")
+
+    fun mergeSeatConfigurations(vehicle: Vehicle): Vehicle {
+        if (!vehicle.seatConfigurations?.seatConfigs.isNullOrEmpty()) return vehicle
+        val cached = seatConfigurationsByVin[vehicle.vin.trim()] ?: return vehicle
+        return vehicle.copy(seatConfigurations = cached)
+    }
+
+    private fun cacheSeatConfigurations(vin: String, configs: SeatConfigurations?) {
+        val normalizedVin = vin.trim()
+        if (normalizedVin.isEmpty() || configs == null || configs.seatConfigs.isEmpty()) return
+        seatConfigurationsByVin[normalizedVin] = configs
+    }
+
+    private fun kiaUsForcedStatusPayload(json: JsonObject?): JsonObject? =
+        json?.childObject("payload.vehicleStatusRpt.vehicleStatus")
+            ?: json?.childObject("payload.vehicleInfo.vehicleStatusRpt.vehicleStatus")
+
+    private fun kiaUsVehicleInfoRequest(vehicleKey: String): JsonObject = JsonObject().apply {
+        add("vehicleConfigReq", JsonObject().apply {
+            addProperty("airTempRange", "0")
+            addProperty("maintenance", "1")
+            addProperty("seatHeatCoolOption", "1")
+            addProperty("vehicle", "1")
+            addProperty("vehicleFeature", "0")
+        })
+        add("vehicleInfoReq", JsonObject().apply {
+            addProperty("drivingActivty", "0")
+            addProperty("dtc", "1")
+            addProperty("enrollment", "1")
+            addProperty("functionalCards", "0")
+            addProperty("location", "1")
+            addProperty("vehicleStatus", "1")
+            addProperty("weather", "0")
+        })
+        add("vinKey", JsonArray().apply { add(vehicleKey) })
+    }
+
+    private fun kiaUsVehicleKey(vin: String, registrationId: String): String = registrationId.ifBlank { vin }
+
+    private suspend fun saveKiaUsSession(
+        username: String,
+        sid: String,
+        refreshToken: String,
+        servicePin: String,
+        expiresIn: Int = 1799
+    ) {
+        preferencesManager.saveSession(
+            accessToken = sid,
+            refreshToken = refreshToken,
+            username = username,
+            expiresIn = expiresIn,
+            servicePin = servicePin
+        )
+        preferencesManager.clearOtpPending()
+    }
+
+    private suspend fun kiaUsSendOtp(challenge: PendingOtpChallenge.KiaUs): Result<Unit> {
+        val notifyType = KiaUsOtpResponses.notifyType(challenge.selectedMethod)
+        val sendResponse = getKiaUsApiService().sendOtp(
+            otpKey = challenge.otpKey,
+            notifyType = notifyType,
+            xid = challenge.xid
+        )
+        val sendJson = sendResponse.body()
+        if (!sendResponse.isSuccessful || kiaUsStatusFailed(sendJson)) {
+            return Result.Error(
+                kiaUsErrorMessage(sendJson, "Verification code could not be sent (${sendResponse.code()})"),
+                sendResponse.code()
+            )
+        }
+        return Result.Success(Unit)
+    }
+
+    private suspend fun startKiaUsOtpChallenge(
+        username: String,
+        password: String,
+        servicePin: String,
+        otpKey: String,
+        xid: String,
+        json: JsonObject?,
+        method: OtpDeliveryMethod? = null,
+        fromRefresh: Boolean = false
+    ): Result<Unit> {
+        val options = KiaUsOtpResponses.parseContactOptions(json)
+            ?: return Result.Error("Verification setup did not return contact options.")
+        val available = KiaUsOtpResponses.availableMethods(options)
+        val selected = when {
+            method != null && method in available -> method
+            else -> KiaUsOtpResponses.preferredDeliveryMethod(options)
+        }
+        val destination = KiaUsOtpResponses.destinationLabel(selected, options)
+        val challenge = PendingOtpChallenge.KiaUs(
+            username = username,
+            password = password,
+            servicePin = servicePin,
+            destinationLabel = destination,
+            availableMethods = available,
+            selectedMethod = selected,
+            otpKey = otpKey,
+            xid = xid,
+            refreshTokenExpired = options.refreshTokenExpired,
+            email = options.email,
+            phone = options.phone
+        )
+        when (val sendResult = kiaUsSendOtp(challenge)) {
+            is Result.Error -> return sendResult
+            else -> Unit
+        }
+        pendingOtpChallenge = challenge
+        val message = if (fromRefresh) {
+            "Session expired. A verification code was sent to $destination."
+        } else {
+            "A verification code was sent to $destination. Enter that code below to finish signing in."
+        }
+        pendingOtpMessage = message
+        if (fromRefresh) {
+            preferencesManager.setOtpPending(username)
+        }
+        return Result.Error(message, OTP_REQUIRED_CODE)
+    }
+
+    private suspend fun loginKiaUs(username: String, password: String, servicePin: String): Result<Unit> {
+        return try {
+            pendingOtpChallenge = null
+            pendingOtpMessage = null
+            val response = getKiaUsApiService().authUser(kiaUsLoginBody(username, password))
+            val json = response.body()
+            val sid = response.headerAny("sid").orEmpty()
+            val refreshToken = response.headerAny("rmtoken").orEmpty()
+
+            if (response.isSuccessful && sid.isNotBlank()) {
+                saveKiaUsSession(username, sid, refreshToken, servicePin)
+                preferencesManager.clearOtpPending()
+                return Result.Success(Unit)
+            }
+
+            val otpKey = KiaUsOtpResponses.hasOtpKey(json)
+            if (response.isSuccessful && otpKey != null) {
+                val xid = response.headerAny("xid").orEmpty()
+                return startKiaUsOtpChallenge(username, password, servicePin, otpKey, xid, json)
+            }
+
+            Result.Error(kiaUsErrorMessage(json, "Kia login failed (${response.code()})"), response.code())
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Kia login network error. Check your connection.")
+        }
+    }
+
+    fun getOtpChallengeUi(): OtpChallengeUi? {
+        val challenge = pendingOtpChallenge ?: return null
+        return OtpChallengeUi(
+            destinationLabel = challenge.destinationLabel,
+            availableMethods = challenge.availableMethods,
+            selectedMethod = challenge.selectedMethod,
+            supportsTrustDevice = challenge.supportsTrustDevice,
+            rememberDeviceDefault = (challenge as? PendingOtpChallenge.Canada)?.rememberDevice ?: true,
+            message = pendingOtpMessage
+        )
+    }
+
+    suspend fun resumeOtpIfPending(): OtpChallengeUi? {
+        if (!preferencesManager.otpPending.first()) return null
+        val savedCredentials = secureCredentialsManager.getSavedCredentials() ?: return null
+        if (pendingOtpChallenge != null) return getOtpChallengeUi()
+        return when {
+            isCanadaRegion() -> {
+                when (startCanadaOtpChallenge(
+                    username = savedCredentials.username,
+                    password = savedCredentials.password,
+                    servicePin = savedCredentials.servicePin,
+                    fromRefresh = true
+                )) {
+                    is Result.Error -> if (pendingOtpChallenge != null) getOtpChallengeUi() else null
+                    else -> null
+                }
+            }
+            isKiaUsRegion() -> {
+                when (val loginResult = loginKiaUs(
+                    savedCredentials.username,
+                    savedCredentials.password,
+                    savedCredentials.servicePin
+                )) {
+                    is Result.Error -> if (loginResult.code == OTP_REQUIRED_CODE) getOtpChallengeUi() else null
+                    else -> null
+                }
+            }
+            else -> null
+        }
+    }
+
+    suspend fun selectOtpDeliveryMethod(method: OtpDeliveryMethod): Result<Unit> {
+        val challenge = pendingOtpChallenge
+            ?: return Result.Error("Verification expired. Sign in again to request a new code.", OTP_REQUIRED_CODE)
+        if (method !in challenge.availableMethods) {
+            return Result.Error("That delivery method is not available for this account.", OTP_REQUIRED_CODE)
+        }
+        return when (challenge) {
+            is PendingOtpChallenge.KiaUs -> {
+                val updated = challenge.copy(
+                    selectedMethod = method,
+                    destinationLabel = KiaUsOtpResponses.destinationLabel(
+                        method,
+                        KiaUsOtpResponses.ContactOptions(
+                            hasEmail = challenge.availableMethods.contains(OtpDeliveryMethod.EMAIL),
+                            hasPhone = challenge.availableMethods.contains(OtpDeliveryMethod.SMS),
+                            email = challenge.email,
+                            phone = challenge.phone,
+                            refreshTokenExpired = challenge.refreshTokenExpired
+                        )
+                    )
+                )
+                pendingOtpChallenge = updated
+                kiaUsSendOtp(updated).also { result ->
+                    if (result is Result.Success) {
+                        pendingOtpMessage = "A verification code was sent to ${updated.destinationLabel}."
+                    }
+                }
+            }
+            is PendingOtpChallenge.Canada -> {
+                val deviceId = preferencesManager.getOrCreateCanadaDeviceId()
+                when (val sendResult = canadaSendOtp(
+                    deviceId = deviceId,
+                    userInfoUuid = challenge.userInfoUuid,
+                    otpEmail = challenge.email,
+                    phone = challenge.phone,
+                    method = method
+                )) {
+                    is Result.Success -> {
+                        pendingOtpChallenge = challenge.copy(
+                            selectedMethod = method,
+                            destinationLabel = canadaDestinationLabel(method, challenge.email, challenge.phone),
+                            otpKey = sendResult.data
+                        )
+                        pendingOtpMessage = "A verification code was sent to ${canadaDestinationLabel(method, challenge.email, challenge.phone)}."
+                        Result.Success(Unit)
+                    }
+                    is Result.Error -> sendResult
+                    else -> Result.Error("Could not send verification code.", OTP_REQUIRED_CODE)
+                }
+            }
+        }
+    }
+
+    suspend fun resendOtp(): Result<Unit> {
+        val challenge = pendingOtpChallenge
+            ?: return Result.Error("Verification expired. Sign in again to request a new code.", OTP_REQUIRED_CODE)
+        return when (challenge) {
+            is PendingOtpChallenge.KiaUs -> kiaUsSendOtp(challenge).also { result ->
+                if (result is Result.Success) {
+                    pendingOtpMessage = "A new verification code was sent to ${challenge.destinationLabel}."
+                }
+            }
+            is PendingOtpChallenge.Canada -> {
+                val otpKey = challenge.otpKey
+                    ?: return Result.Error("Verification is not ready yet. Choose a delivery method first.", OTP_REQUIRED_CODE)
+                val deviceId = preferencesManager.getOrCreateCanadaDeviceId()
+                canadaSendOtp(
+                    deviceId = deviceId,
+                    userInfoUuid = challenge.userInfoUuid,
+                    otpEmail = challenge.email,
+                    phone = challenge.phone,
+                    method = challenge.selectedMethod
+                ).let { result ->
+                    when (result) {
+                        is Result.Success -> {
+                            pendingOtpChallenge = challenge.copy(otpKey = result.data)
+                            pendingOtpMessage = "A new verification code was sent to ${challenge.destinationLabel}."
+                            Result.Success(Unit)
+                        }
+                        is Result.Error -> result
+                        else -> Result.Error("Could not resend verification code.", OTP_REQUIRED_CODE)
+                    }
+                }
+            }
+        }
+    }
+
+    suspend fun completeOtpLogin(otpCode: String, rememberDevice: Boolean = true): Result<Unit> {
+        val challenge = pendingOtpChallenge
+            ?: return Result.Error("Verification expired. Sign in again to request a new code.", OTP_REQUIRED_CODE)
+        val cleanCode = otpCode.filter { it.isDigit() }
+        if (cleanCode.isBlank()) return Result.Error("Enter the verification code.", OTP_REQUIRED_CODE)
+
+        return when (challenge) {
+            is PendingOtpChallenge.KiaUs -> completeKiaUsOtpLogin(challenge, cleanCode)
+            is PendingOtpChallenge.Canada -> completeCanadaOtpLogin(challenge, cleanCode, rememberDevice)
+        }
+    }
+
+    private suspend fun completeCanadaOtpLogin(
+        challenge: PendingOtpChallenge.Canada,
+        cleanCode: String,
+        rememberDevice: Boolean
+    ): Result<Unit> {
+        val otpKey = challenge.otpKey
+            ?: return Result.Error("Verification is not ready yet. Request a new code.", OTP_REQUIRED_CODE)
+        return try {
+            val deviceId = preferencesManager.getOrCreateCanadaDeviceId()
+            val validateResponse = getCanadaApiService().validateOtp(
+                deviceId = deviceId,
+                body = mapOf(
+                    "otpNo" to cleanCode,
+                    "userAccount" to challenge.username,
+                    "otpKey" to otpKey,
+                    "mfaApiCode" to CanadaMfaResponses.MFA_API_CODE
+                )
+            )
+            val validateRaw = readCanadaHttpBody(validateResponse)
+            val validateJson = parseCanadaJsonBody(validateRaw)
+            if (validateJson == null) {
+                return Result.Error(canadaUnreadableBodyMessage(validateRaw, validateResponse.code()), validateResponse.code())
+            }
+            val errorCode = validateJson.objectOrNull("error")?.stringOrNull("errorCode")
+            if (!CanadaMfaResponses.isSuccess(validateJson)) {
+                val message = when (errorCode) {
+                    CanadaMfaResponses.ERROR_OTP_FAILED -> "Invalid verification code. Check the code and try again."
+                    else -> canadaErrorMessage(validateJson, "Verification failed (${validateResponse.code()})")
+                }
+                return Result.Error(message, validateResponse.code())
+            }
+            val validated = CanadaMfaResponses.parseValidatedOtp(validateJson)
+                ?: return Result.Error("Verification did not return a validation key.")
+            if (!validated.verified) {
+                return Result.Error("Invalid verification code. Check the code and try again.", OTP_REQUIRED_CODE)
+            }
+
+            val tokenResponse = getCanadaApiService().generateMfaToken(
+                deviceId = deviceId,
+                body = mapOf(
+                    "userAccount" to challenge.username,
+                    "otpEmail" to challenge.email,
+                    "mfaApiCode" to CanadaMfaResponses.MFA_API_CODE,
+                    "otpValidationKey" to validated.otpValidationKey,
+                    "mfaYn" to if (rememberDevice) "Y" else "N"
+                )
+            )
+            val tokenRaw = readCanadaHttpBody(tokenResponse)
+            val tokenJson = parseCanadaJsonBody(tokenRaw)
+            if (tokenJson == null) {
+                return Result.Error(canadaUnreadableBodyMessage(tokenRaw, tokenResponse.code()), tokenResponse.code())
+            }
+            if (!CanadaMfaResponses.isSuccess(tokenJson)) {
+                return Result.Error(canadaErrorMessage(tokenJson, "Login completion failed (${tokenResponse.code()})"), tokenResponse.code())
+            }
+            val mfaToken = CanadaMfaResponses.parseMfaToken(tokenJson)
+                ?: tokenJson.objectOrNull("result")?.objectOrNull("token")?.let { tokenObj ->
+                    CanadaMfaResponses.MfaToken(
+                        accessToken = tokenObj.stringOrNull("accessToken").orEmpty(),
+                        refreshToken = tokenObj.stringOrNull("refreshToken").orEmpty(),
+                        expireIn = tokenObj.intOrNull("expireIn") ?: 86400
+                    )
+                }
+                ?: return Result.Error("Login completion did not return a token.")
+            saveCanadaSession(
+                username = challenge.username,
+                password = challenge.password,
+                servicePin = challenge.servicePin,
+                token = JsonObject().apply {
+                    addProperty("accessToken", mfaToken.accessToken)
+                    addProperty("refreshToken", mfaToken.refreshToken)
+                    addProperty("expireIn", mfaToken.expireIn)
+                }
+            )
+            pendingOtpChallenge = null
+            pendingOtpMessage = null
+            Result.Success(Unit)
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Verification network error. Check your connection.")
+        }
+    }
+
+    private suspend fun completeKiaUsOtpLogin(
+        challenge: PendingOtpChallenge.KiaUs,
+        cleanCode: String
+    ): Result<Unit> {
+        return try {
+            val verifyResponse = getKiaUsApiService().verifyOtp(
+                otpKey = challenge.otpKey,
+                xid = challenge.xid,
+                body = JsonObject().apply { addProperty("otp", cleanCode) }
+            )
+            val verifyJson = verifyResponse.body()
+            if (!verifyResponse.isSuccessful || kiaUsStatusFailed(verifyJson)) {
+                return Result.Error(kiaUsErrorMessage(verifyJson, "Verification failed (${verifyResponse.code()})"), verifyResponse.code())
+            }
+
+            val sid = verifyResponse.headerAny("sid").orEmpty()
+            val refreshToken = verifyResponse.headerAny("rmtoken").orEmpty()
+            if (sid.isBlank() || refreshToken.isBlank()) {
+                return Result.Error("Verification succeeded but no session token was returned.")
+            }
+
+            val completeResponse = getKiaUsApiService().authUser(
+                body = kiaUsLoginBody(challenge.username, challenge.password, includeTnc = false),
+                sid = sid,
+                refreshToken = refreshToken
+            )
+            val completeJson = completeResponse.body()
+            val finalSid = completeResponse.headerAny("sid") ?: sid
+            if (!completeResponse.isSuccessful || finalSid.isBlank() || kiaUsStatusFailed(completeJson)) {
+                return Result.Error(kiaUsErrorMessage(completeJson, "Login completion failed (${completeResponse.code()})"), completeResponse.code())
+            }
+
+            saveKiaUsSession(
+                username = challenge.username,
+                sid = finalSid,
+                refreshToken = refreshToken,
+                servicePin = challenge.servicePin
+            )
+            pendingOtpChallenge = null
+            pendingOtpMessage = null
+            preferencesManager.clearOtpPending()
+            Result.Success(Unit)
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Verification network error. Check your connection.")
+        }
+    }
+
+    private suspend fun refreshKiaUsAccessToken(refreshToken: String): String {
+        val username = getUsername()
+        val savedCredentials = secureCredentialsManager.getSavedCredentials()
+        val password = savedCredentials?.password ?: throw IllegalStateException("Kia session expired. Please sign in again.")
+        val response = getKiaUsApiService().authUser(
+            body = kiaUsLoginBody(username, password),
+            refreshToken = refreshToken
+        )
+        val json = response.body()
+        val sid = response.headerAny("sid").orEmpty()
+        val nextRefreshToken = response.headerAny("rmtoken") ?: refreshToken
+        if (!response.isSuccessful || sid.isBlank() || kiaUsStatusFailed(json)) {
+            val otpKey = KiaUsOtpResponses.hasOtpKey(json)
+            if (otpKey != null) {
+                val servicePin = getServicePin(required = false)
+                when (startKiaUsOtpChallenge(
+                    username = username,
+                    password = password,
+                    servicePin = servicePin,
+                    otpKey = otpKey,
+                    xid = response.headerAny("xid").orEmpty(),
+                    json = json,
+                    fromRefresh = true
+                )) {
+                    is Result.Error -> throw OtpRequiredException(pendingOtpMessage ?: "Verification code required.")
+                    else -> throw OtpRequiredException("Verification code required.")
+                }
+            }
+            throw IllegalStateException(kiaUsErrorMessage(json, "Kia token refresh failed (${response.code()})"))
+        }
+        saveKiaUsSession(username, sid, nextRefreshToken, getServicePin(required = false))
+        return sid
+    }
+
+    private suspend fun getKiaUsVehicles(): Result<List<Vehicle>> {
+        return try {
+            val sid = getToken()
+            val response = getKiaUsApiService().getVehicles(sid)
+            val json = response.body()
+            if (!response.isSuccessful || kiaUsStatusFailed(json)) {
+                return Result.Error(kiaUsErrorMessage(json, "Failed to fetch Kia vehicles (${response.code()})"), response.code())
+            }
+
+            val summaries = json
+                ?.objectOrNull("payload")
+                ?.arrayOrNull("vehicleSummary")
+                ?: JsonArray()
+
+            val vehicles = mutableListOf<Vehicle>()
+            for (entry in summaries) {
+                val vehicleObj = entry.asKiaJsonObjectOrNull() ?: continue
+                val vehicleKey = vehicleObj.stringOrNull("vehicleKey").orEmpty()
+                val vehicleId = vehicleObj.stringOrNull("vehicleIdentifier")
+                    ?: vehicleObj.stringOrNull("vehicleId")
+                    ?: vehicleKey
+
+                var vin = vehicleObj.stringOrNull("vin").orEmpty()
+                var nickname = vehicleObj.stringOrNull("nickName")
+                    ?: vehicleObj.stringOrNull("vehicleNickName")
+                    ?: vehicleObj.stringOrNull("nickname").orEmpty()
+                var modelCode = vehicleObj.stringOrNull("modelCode") ?: vehicleObj.stringOrNull("salesModelCode").orEmpty()
+                var modelName = vehicleObj.stringOrNull("modelName") ?: vehicleObj.stringOrNull("series").orEmpty()
+                var modelYear = vehicleObj.stringOrNull("modelYear").orEmpty()
+                var colorName = vehicleObj.stringOrNull("exteriorColor") ?: vehicleObj.stringOrNull("color").orEmpty()
+                var generation = vehicleObj.stringOrNull("generation") ?: vehicleObj.stringOrNull("vehicleGeneration") ?: "3"
+                var odometer = vehicleObj.intOrNull("odometer") ?: vehicleObj.intOrNull("mileage") ?: 0
+                var seatConfigurations: SeatConfigurations? = extractSeatConfigurations(vehicleObj)
+
+                if (vehicleKey.isNotBlank()) {
+                    try {
+                        val infoResponse = getKiaUsApiService().getCachedVehicleInfo(
+                            sid = sid,
+                            vehicleKey = vehicleKey,
+                            body = kiaUsVehicleInfoRequest(vehicleKey)
+                        )
+                        val infoJson = infoResponse.body()
+                        if (infoResponse.isSuccessful && !kiaUsStatusFailed(infoJson)) {
+                            val vehicleInfo = infoJson
+                                ?.objectOrNull("payload")
+                                ?.arrayOrNull("vehicleInfoList")
+                                ?.firstOrNull()
+                                ?.asKiaJsonObjectOrNull()
+                            val vehicle = vehicleInfo?.childObject("vehicleConfig.vehicleDetail.vehicle")
+                            val trim = vehicle?.objectOrNull("trim")
+                            vin = vehicle?.stringOrNull("vin") ?: vin
+                            nickname = vehicleInfo?.childString("lastVehicleInfo.vehicleNickName") ?: nickname
+                            modelCode = trim?.stringOrNull("salesModelCode") ?: modelCode
+                            modelName = trim?.stringOrNull("modelName") ?: modelName
+                            modelYear = trim?.stringOrNull("modelYear") ?: modelYear
+                            colorName = vehicle?.stringOrNull("exteriorColor") ?: colorName
+                            generation = vehicleInfo?.childString("vehicleConfig.vehicleDetail.device.telematics.generation") ?: generation
+                            odometer = vehicle?.intOrNull("mileage") ?: odometer
+                            val fromInfo = extractSeatConfigurations(vehicleInfo ?: JsonObject())
+                                ?: vehicleInfo?.childObject("vehicleConfig.vehicleDetail.vehicle")
+                                    ?.let { extractSeatConfigurations(it) }
+                            seatConfigurations = fromInfo ?: seatConfigurations
+                            cacheSeatConfigurations(vin, seatConfigurations)
+                        }
+                    } catch (_: Exception) {
+                        // Keep the vehicle entry from ownr/gvl even when the optional detail call fails.
+                    }
+                }
+
+                vehicles.add(
+                    Vehicle(
+                        vin = vin.ifBlank { vehicleId },
+                        vehicleIdentifier = vehicleId,
+                        enrollmentId = vehicleId,
+                        regId = vehicleKey.ifBlank { vehicleId },
+                        vehicleKey = vehicleKey,
+                        generation = generation,
+                        nickname = nickname,
+                        modelCode = modelCode,
+                        modelName = modelName,
+                        modelYear = modelYear,
+                        colorName = colorName,
+                        brandIndicator = "K",
+                        odometer = odometer,
+                        seatConfigurations = seatConfigurations
+                    )
+                )
+            }
+            Result.Success(vehicles)
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Kia vehicle list network error")
+        }
+    }
+
+    private suspend fun getKiaUsVehicleStatus(vin: String, forceRefresh: Boolean, registrationId: String): Result<VehicleStatusData> {
+        return try {
+            val sid = getToken()
+            val vehicleKey = kiaUsVehicleKey(vin, registrationId)
+            val response = if (forceRefresh) {
+                getKiaUsApiService().forceRefreshVehicleInfo(
+                    sid = sid,
+                    vehicleKey = vehicleKey,
+                    body = JsonObject().apply { addProperty("requestType", 0) }
+                )
+            } else {
+                getKiaUsApiService().getCachedVehicleInfo(
+                    sid = sid,
+                    vehicleKey = vehicleKey,
+                    body = kiaUsVehicleInfoRequest(vehicleKey)
+                )
+            }
+            val json = response.body()
+            if (!response.isSuccessful || kiaUsStatusFailed(json)) {
+                return Result.Error(kiaUsErrorMessage(json, "Kia status fetch failed (${response.code()})"), response.code())
+            }
+            val rawStatus = (if (forceRefresh) {
+                kiaUsForcedStatusPayload(json) ?: kiaUsCachedStatusPayload(json)
+            } else {
+                kiaUsCachedStatusPayload(json)
+            }) ?: return Result.Error("Could not parse Kia vehicle status")
+            val normalizedStatus = normalizeKiaUsStatus(rawStatus)
+            populateKiaUsChargeTargetsFromApi(sid, vehicleKey, normalizedStatus)
+            kiaUsVehicleInfoEntry(json)?.let { entry ->
+                val fromInfo = extractSeatConfigurations(entry)
+                    ?: entry.childObject("vehicleConfig.vehicleDetail.vehicle")?.let { extractSeatConfigurations(it) }
+                cacheSeatConfigurations(vin, fromInfo)
+            }
+            val data = gson.fromJson(normalizedStatus, VehicleStatusData::class.java)
+            preferencesManager.setLastStatusRefresh(System.currentTimeMillis())
+            Result.Success(data)
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Kia status network error")
+        }
+    }
+
+    private suspend fun runKiaUsCommand(
+        vin: String,
+        registrationId: String,
+        actionName: String,
+        block: suspend (sid: String, vehicleKey: String) -> retrofit2.Response<ResponseBody>
+    ): Result<Unit> {
+        return try {
+            val sid = getToken()
+            val vehicleKey = kiaUsVehicleKey(vin, registrationId)
+            val response = block(sid, vehicleKey)
+            validateRawCommandResponse(response, actionName)
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "$actionName network error")
+        }
+    }
+
+    private suspend fun populateKiaUsChargeTargetsFromApi(
+        sid: String,
+        vehicleKey: String,
+        normalizedStatus: JsonObject
+    ) {
+        runCatching {
+            val response = getKiaUsApiService().getChargeTargets(sid, vehicleKey)
+            val json = response.body()
+            if (!response.isSuccessful || kiaUsStatusFailed(json)) return
+            val targets = json
+                ?.objectOrNull("payload")
+                ?.arrayOrNull("targetSOClist")
+                ?: json?.arrayOrNull("targetSOClist")
+                ?: return
+            val evStatus = normalizedStatus.objectOrNull("evStatus") ?: JsonObject().also {
+                normalizedStatus.add("evStatus", it)
+            }
+            evStatus.add("reservChargeInfos", JsonObject().apply {
+                add("targetSOClist", targets.deepCopy())
+            })
+        }
+    }
+
+    private fun kiaUsClimatePayload(
+        tempF: String,
+        hvacOn: Boolean,
+        defrost: Boolean,
+        heatedSteering: Boolean,
+        driverSeatHeat: Int,
+        passengerSeatHeat: Int,
+        rearLeftSeatHeat: Int,
+        rearRightSeatHeat: Int,
+        durationMinutes: Int
+    ): JsonObject = JsonObject().apply {
+        add("remoteClimate", JsonObject().apply {
+            add("airTemp", JsonObject().apply {
+                addProperty("unit", 1)
+                addProperty("value", tempF)
+            })
+            addProperty("airCtrl", hvacOn)
+            addProperty("defrost", defrost)
+            val heatingAccessory = JsonObject().apply {
+                // Keep Kia's rear-window / mirror defrost controls out of the payload unless
+                // the user explicitly asked for defrost. Some Kia USA vehicles appear to treat
+                // the presence of the accessory-heating block as an accessory-defrost request,
+                // even when rearWindow/sideMirror are sent as 0.
+                if (defrost) {
+                    addProperty("rearWindow", 1)
+                    addProperty("sideMirror", 1)
+                }
+                if (heatedSteering) {
+                    addProperty("steeringWheel", 1)
+                    // Use the lowest on-step. Sending step 2 has been observed on some Kia
+                    // vehicles to activate extra defrost behavior along with the wheel.
+                    addProperty("steeringWheelStep", 1)
+                }
+            }
+            if (heatingAccessory.size() > 0) {
+                add("heatingAccessory", heatingAccessory)
+            }
+            add("ignitionOnDuration", JsonObject().apply {
+                addProperty("unit", 4)
+                addProperty("value", durationMinutes.coerceIn(2, 10))
+            })
+            val seatLevels = listOf(driverSeatHeat, passengerSeatHeat, rearLeftSeatHeat, rearRightSeatHeat)
+            if (seatLevels.any { it != 2 }) {
+                add("heatVentSeat", JsonObject().apply {
+                    add("driverSeat", kiaUsSeatSetting(driverSeatHeat))
+                    add("passengerSeat", kiaUsSeatSetting(passengerSeatHeat))
+                    add("rearLeftSeat", kiaUsSeatSetting(rearLeftSeatHeat))
+                    add("rearRightSeat", kiaUsSeatSetting(rearRightSeatHeat))
+                })
+            }
+        })
+    }
+
+    private fun kiaUsSeatSetting(level: Int): JsonObject {
+        val (type, heatLevel, step) = when (level) {
+            8 -> Triple(1, 4, 1)
+            7 -> Triple(1, 3, 2)
+            6 -> Triple(1, 2, 3)
+            5 -> Triple(2, 4, 1)
+            4 -> Triple(2, 3, 2)
+            3 -> Triple(2, 2, 3)
+            1 -> Triple(1, 4, 1)
+            else -> Triple(0, 1, 0)
+        }
+        return JsonObject().apply {
+            addProperty("heatVentType", type)
+            addProperty("heatVentLevel", heatLevel)
+            addProperty("heatVentStep", step)
+        }
+    }
+
+    // ─── Auth ──────────────────────────────────────────────────────────────────
+
+    suspend fun enterDemoMode(): Result<Unit> {
+        demoVehicleStore.reset()
+        preferencesManager.setDemoMode(true)
+        preferencesManager.setStayLoggedIn30Days(true)
+        preferencesManager.saveSession(
+            accessToken = "demo-access-token",
+            refreshToken = "demo-refresh-token",
+            username = DemoVehicleStore.DEMO_USERNAME,
+            expiresIn = 30 * 24 * 60 * 60,
+            servicePin = DemoVehicleStore.DEMO_PIN
+        )
+        val firstVin = demoVehicleStore.getVehicles().firstOrNull()?.vin
+        if (!firstVin.isNullOrBlank()) {
+            preferencesManager.setSelectedVin(firstVin)
+        }
+        return Result.Success(Unit)
+    }
+
+    suspend fun login(username: String, password: String, servicePin: String = ""): Result<Unit> {
+        demoVehicleStore.clear()
+        preferencesManager.setDemoMode(false)
+        if (isKiaUsRegion()) return loginKiaUs(username, password, servicePin)
+        if (isCanadaRegion()) return loginCanada(username, password, servicePin)
+        if (isEuropeRegion()) return loginEurope(username, password, servicePin)
+        if (isAustraliaRegion()) return loginAustralia(username, password, servicePin)
+        return try {
+            val response = getApiService().getToken(
+                LoginRequest(username = username, password = password)
+            )
+            if (response.isSuccessful) {
+                val token = response.body() ?: return Result.Error("Empty response")
+                preferencesManager.saveSession(
+                    accessToken = token.accessToken,
+                    refreshToken = token.refreshToken,
+                    username = username,
+                    expiresIn = token.expiresIn.toIntOrNull() ?: 1799,
+                    servicePin = servicePin
+                )
+                Result.Success(Unit)
+            } else {
+                val errorBody = response.errorBody()?.string().orEmpty()
+                if (errorBody.contains("otpKey", ignoreCase = true) ||
+                    errorBody.contains("otp", ignoreCase = true) && errorBody.contains("verify", ignoreCase = true)
+                ) {
+                    return Result.Error(
+                        "Hyundai login requires device verification that BlueDeck does not support yet for US Hyundai. Try the official MyHyundai app once, then sign in again.",
+                        response.code()
+                    )
+                }
+                Result.Error(
+                    when (response.code()) {
+                        401 -> "Invalid username or password"
+                        403 -> "Account locked. Please use the Bluelink app to unlock."
+                        429 -> "Too many attempts. Please wait before trying again."
+                        else -> "Login failed (${response.code()})"
+                    },
+                    response.code()
+                )
+            }
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Network error. Check your connection.")
+        }
+    }
+
+    suspend fun logout(requirePassword: Boolean = true) {
+        pendingOtpChallenge = null
+        pendingOtpMessage = null
+        if (requirePassword) {
+            preferencesManager.clearOtpPending()
+        }
+        demoVehicleStore.clear()
+        preferencesManager.clearSession(requirePassword = requirePassword)
+        apiClient = null
+        apiClientRegion = null
+        canadaApiClient = null
+        canadaApiClientRegion = null
+        euApiClient = null
+        euApiClientRegion = null
+        euApiClientDeviceId = null
+        euIdentityApiClient = null
+        euIdentityApiClientRegion = null
+        auApiClient = null
+        auApiClientRegion = null
+        auApiClientDeviceId = null
+        kiaUsApiClient = null
+        kiaUsApiClientDeviceId = null
+    }
+
+    // ─── Vehicles ──────────────────────────────────────────────────────────────
+
+    suspend fun getVehicles(): Result<List<Vehicle>> {
+        if (preferencesManager.isDemoMode()) {
+            return Result.Success(demoVehicleStore.getVehicles())
+        }
+        if (isKiaUsRegion()) return getKiaUsVehicles()
+        if (isCanadaRegion()) return getCanadaVehicles()
+        if (isEuropeRegion()) return getEuropeVehicles()
+        if (isAustraliaRegion()) return getAustraliaVehicles()
+        return try {
+            var token = getToken()
+            val username = getUsername()
+            var response = getApiService().getVehicles(
+                accessToken = token,
+                username = username
+            )
+            if (!response.isSuccessful && (response.code() == 401 || response.code() == 403)) {
+                token = runCatching {
+                    val refresh = preferencesManager.refreshToken.first().orEmpty()
+                    if (refresh.isNotBlank()) refreshUsHyundaiAccessToken(refresh)
+                    else refreshPasswordBasedSession()
+                }.getOrNull().orEmpty()
+                if (token.isNotBlank()) {
+                    response = getApiService().getVehicles(
+                        accessToken = token,
+                        username = getUsername()
+                    )
+                }
+            }
+            if (response.isSuccessful) {
+                val body = response.body()
+                val vehicles = if (body == null) {
+                    emptyList()
+                } else {
+                    val listResponse = gson.fromJson(body, VehicleListResponse::class.java)
+                    listResponse.vehicles.map { detail ->
+                        var vehicle = detail.vehicle.copy(packageDetails = detail.packageDetails)
+                        if (vehicle.seatConfigurations == null) {
+                            val extracted = enrollmentEntryForVin(body, vehicle.vin)?.let { entry ->
+                                extractSeatConfigurationsFromEnrollment(entry)
+                            } ?: extractSeatConfigurations(body)
+                            if (extracted != null) {
+                                vehicle = vehicle.copy(seatConfigurations = extracted)
+                                cacheSeatConfigurations(vehicle.vin, extracted)
+                            } else {
+                                android.util.Log.d(
+                                    "VehicleRepository",
+                                    "seat configs missing after login for ${vehicle.vin}"
+                                )
+                            }
+                        }
+                        vehicle
+                    }
+                }
+                Result.Success(vehicles)
+            } else {
+                if (response.code() == 401 || response.code() == 403) {
+                    preferencesManager.clearSession(requirePassword = true)
+                    Result.Error("Session expired. Please sign in again.", response.code())
+                } else {
+                    Result.Error("Failed to fetch vehicles (${response.code()})")
+                }
+            }
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Network error")
+        }
+    }
+
+    // ─── Status ────────────────────────────────────────────────────────────────
+
+    suspend fun getVehicleStatus(
+        vin: String,
+        forceRefresh: Boolean = false,
+        registrationId: String = "",
+        generation: String = "3",
+        brandIndicator: String = "H"
+    ): Result<VehicleStatusData> {
+        if (preferencesManager.isDemoMode()) {
+            val status = demoVehicleStore.getStatus(vin)
+            preferencesManager.setLastStatusRefresh(System.currentTimeMillis())
+            return Result.Success(status)
+        }
+        if (isKiaUsRegion()) return getKiaUsVehicleStatus(vin, forceRefresh, registrationId)
+        if (isCanadaRegion()) return getCanadaVehicleStatus(vin, forceRefresh, registrationId)
+        if (isEuropeRegion()) return getEuropeVehicleStatus(vin, forceRefresh, registrationId, generation)
+        if (isAustraliaRegion()) return getAustraliaVehicleStatus(vin, forceRefresh, registrationId, generation)
+        return try {
+            val token = getToken()
+            val username = getUsername()
+            val api = getApiService()
+
+            val response = api.getVehicleStatus(
+                accessToken = token,
+                username = username,
+                vin = vin,
+                appCloudVin = vin,
+                refresh = forceRefresh.toString(),
+                registrationId = registrationId,
+                gen = generation,
+                brandIndicator = brandIndicator
+            )
+
+            if (response.isSuccessful) {
+                val data = response.body()?.vehicleStatus
+                    ?: return Result.Error("Could not parse vehicle status")
+                preferencesManager.setLastStatusRefresh(System.currentTimeMillis())
+                Result.Success(data)
+            } else {
+                Result.Error("Status fetch failed (${response.code()})")
+            }
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Network error")
+        }
+    }
+
+
+    suspend fun getVehicleLocation(
+        vin: String,
+        registrationId: String = "",
+        generation: String = "3",
+        brandIndicator: String = "H"
+    ): Result<VehicleLocation> {
+        if (preferencesManager.isDemoMode()) {
+            return Result.Success(demoVehicleStore.getLocation(vin))
+        }
+        if (isKiaUsRegion()) return Result.Error("Vehicle location for USA Kia is returned in the status payload but is not mapped into the BlueDeck location model yet.")
+        if (isCanadaRegion()) return Result.Error("Vehicle location for Canada is not mapped yet.")
+        if (isEuropeRegion()) return Result.Error("Vehicle location for Europe is not mapped into the BlueDeck location model yet.")
+        if (isAustraliaRegion()) return Result.Error("Vehicle location for Australia/NZ is available in the upstream API but is not mapped into the BlueDeck location model yet.")
+        return try {
+            val token = getToken()
+            val username = getUsername()
+            val response = getApiService().getVehicleLocation(
+                accessToken = token,
+                username = username,
+                vin = vin,
+                appCloudVin = vin,
+                registrationId = registrationId,
+                gen = generation,
+                brandIndicator = brandIndicator
+            )
+
+            if (response.isSuccessful) {
+                val location = response.body()
+                    ?: return Result.Error("Could not parse vehicle location")
+                Result.Success(location)
+            } else {
+                Result.Error("Location fetch failed (${response.code()})")
+            }
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Network error")
+        }
+    }
+
+    // ─── Lock / Unlock ─────────────────────────────────────────────────────────
+
+    suspend fun lockDoors(
+        vin: String,
+        registrationId: String = "",
+        generation: String = "3",
+        brandIndicator: String = "H"
+    ): Result<Unit> {
+        if (preferencesManager.isDemoMode()) {
+            demoVehicleStore.lockDoors(vin)
+            return Result.Success(Unit)
+        }
+        if (isKiaUsRegion()) {
+            return runKiaUsCommand(vin, registrationId, "Lock") { sid, vehicleKey ->
+                getKiaUsApiService().lockDoors(sid, vehicleKey)
+            }
+        }
+        if (isCanadaRegion()) {
+            return runCanadaPinCommand(vin, registrationId, "Lock") { accessToken, vehicleId, pAuth, deviceId, pin ->
+                getCanadaApiService().lockDoors(accessToken, vehicleId, pAuth, deviceId, mapOf("pin" to pin))
+            }
+        }
+        if (isEuropeRegion()) {
+            return runEuropeCommand(vin, registrationId, "Lock") { authorization, vehicleId ->
+                val deviceId = registeredEuropeDeviceId()
+                getEuApiService().controlDoor(authorization, vehicleId, JsonObject().apply {
+                    addProperty("action", "close")
+                    addProperty("deviceId", deviceId)
+                })
+            }
+        }
+        if (isAustraliaRegion()) {
+            return runAustraliaCommand(vin, registrationId, "Lock") { authorization, vehicleId ->
+                getAuApiService().controlDoor(authorization, vehicleId, JsonObject().apply {
+                    addProperty("action", "close")
+                    addProperty("deviceId", australiaDeviceId())
+                })
+            }
+        }
+        return try {
+            val token = getToken()
+            val username = getUsername()
+            val pin = getServicePin(required = false)
+            val response = getApiService().lockDoors(
+                accessToken = token,
+                username = username,
+                vin = vin,
+                appCloudVin = vin,
+                servicePin = pin,
+                registrationId = registrationId,
+                gen = generation,
+                brandIndicator = brandIndicator,
+                formUserName = username,
+                formVin = vin
+            )
+            validateRawCommandResponse(response, "Lock")
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Network error")
+        }
+    }
+
+    suspend fun unlockDoors(
+        vin: String,
+        registrationId: String = "",
+        generation: String = "3",
+        brandIndicator: String = "H"
+    ): Result<Unit> {
+        if (preferencesManager.isDemoMode()) {
+            demoVehicleStore.unlockDoors(vin)
+            return Result.Success(Unit)
+        }
+        if (isKiaUsRegion()) {
+            return runKiaUsCommand(vin, registrationId, "Unlock") { sid, vehicleKey ->
+                getKiaUsApiService().unlockDoors(sid, vehicleKey)
+            }
+        }
+        if (isCanadaRegion()) {
+            return runCanadaPinCommand(vin, registrationId, "Unlock") { accessToken, vehicleId, pAuth, deviceId, pin ->
+                getCanadaApiService().unlockDoors(accessToken, vehicleId, pAuth, deviceId, mapOf("pin" to pin))
+            }
+        }
+        if (isEuropeRegion()) {
+            return runEuropeCommand(vin, registrationId, "Unlock") { authorization, vehicleId ->
+                val deviceId = registeredEuropeDeviceId()
+                getEuApiService().controlDoor(authorization, vehicleId, JsonObject().apply {
+                    addProperty("action", "open")
+                    addProperty("deviceId", deviceId)
+                })
+            }
+        }
+        if (isAustraliaRegion()) {
+            return runAustraliaCommand(vin, registrationId, "Unlock") { authorization, vehicleId ->
+                getAuApiService().controlDoor(authorization, vehicleId, JsonObject().apply {
+                    addProperty("action", "open")
+                    addProperty("deviceId", australiaDeviceId())
+                })
+            }
+        }
+        return try {
+            val token = getToken()
+            val username = getUsername()
+            val pin = getServicePin()
+            val response = getApiService().unlockDoors(
+                accessToken = token,
+                username = username,
+                vin = vin,
+                appCloudVin = vin,
+                servicePin = pin,
+                registrationId = registrationId,
+                gen = generation,
+                brandIndicator = brandIndicator,
+                formUserName = username,
+                formVin = vin
+            )
+            validateRawCommandResponse(response, "Unlock")
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Network error")
+        }
+    }
+
+    // ─── Remote Start / Stop ───────────────────────────────────────────────────
+
+    suspend fun startEngine(
+        vin: String,
+        tempF: String = "72",
+        hvacOn: Boolean = true,
+        defrost: Boolean = false,
+        heatedSteering: Boolean = false,
+        driverSeatHeat: Int = 2,
+        passengerSeatHeat: Int = 2,
+        rearLeftSeatHeat: Int = 2,
+        rearRightSeatHeat: Int = 2,
+        durationMinutes: Int = 10,
+        isEv: Boolean = false,
+        registrationId: String = "",
+        generation: String = "3",
+        brandIndicator: String = "H"
+    ): Result<Unit> {
+        if (preferencesManager.isDemoMode()) {
+            demoVehicleStore.startClimate(
+                vin = vin,
+                tempF = tempF,
+                defrost = defrost,
+                heatedSteering = heatedSteering,
+                driverSeatHeat = driverSeatHeat,
+                passengerSeatHeat = passengerSeatHeat,
+                rearLeftSeatHeat = rearLeftSeatHeat,
+                rearRightSeatHeat = rearRightSeatHeat,
+                isEv = isEv
+            )
+            return Result.Success(Unit)
+        }
+        if (isKiaUsRegion()) {
+            return runKiaUsCommand(vin, registrationId, "Start") { sid, vehicleKey ->
+                getKiaUsApiService().startClimate(
+                    sid = sid,
+                    vehicleKey = vehicleKey,
+                    body = kiaUsClimatePayload(
+                        tempF = tempF,
+                        hvacOn = hvacOn,
+                        defrost = defrost,
+                        heatedSteering = heatedSteering,
+                        driverSeatHeat = driverSeatHeat,
+                        passengerSeatHeat = passengerSeatHeat,
+                        rearLeftSeatHeat = rearLeftSeatHeat,
+                        rearRightSeatHeat = rearRightSeatHeat,
+                        durationMinutes = durationMinutes
+                    )
+                )
+            }
+        }
+        if (isCanadaRegion()) {
+            return startCanadaClimate(
+                vin = vin,
+                registrationId = registrationId,
+                tempF = tempF,
+                defrost = defrost,
+                durationMinutes = durationMinutes,
+                isEv = isEv,
+                driverSeatHeat = driverSeatHeat,
+                passengerSeatHeat = passengerSeatHeat,
+                rearLeftSeatHeat = rearLeftSeatHeat,
+                rearRightSeatHeat = rearRightSeatHeat
+            )
+        }
+        if (isEuropeRegion()) {
+            return runEuropeCommand(vin, registrationId, "Start") { authorization, vehicleId ->
+                val deviceId = registeredEuropeDeviceId()
+                val payload = europeEnginePayload("start", deviceId, tempF, defrost, durationMinutes)
+                if (isEv) getEuApiService().controlEvClimate(authorization, vehicleId, payload) else getEuApiService().controlEngine(authorization, vehicleId, payload)
+            }
+        }
+        if (isAustraliaRegion()) {
+            return runAustraliaCommand(vin, registrationId, "Start") { authorization, vehicleId ->
+                val payload = australiaEnginePayload("start", tempF, defrost, durationMinutes)
+                if (isEv) getAuApiService().controlEvClimate(authorization, vehicleId, payload) else getAuApiService().controlEngine(authorization, vehicleId, payload)
+            }
+        }
+        return try {
+            val token = getToken()
+            val username = getUsername()
+            val pin = getServicePin()
+            val request = RemoteStartRequest(
+                airCtrl = if (hvacOn) 1 else 0,
+                airTemp = AirTempRequest(value = tempF, unit = 1),
+                defrost = defrost,
+                // Hyundai USA uses heating1 as a bit-field-like accessory selector, not
+                // a simple boolean. 0 = off, 3 = heated steering wheel. Sending 1 has
+                // been observed to activate defrost behavior on some Hyundai vehicles.
+                heating1 = if (heatedSteering) 3 else 0,
+                igniOnDuration = durationMinutes,
+                seatHeaterVentInfo = SeatInfo(
+                    driverSeatHeatCool = driverSeatHeat,
+                    passengerSeatHeatCool = passengerSeatHeat,
+                    rearLeftSeatHeatCool = rearLeftSeatHeat,
+                    rearRightSeatHeatCool = rearRightSeatHeat
+                ),
+                username = username,
+                vin = vin
+            )
+            val response = if (isEv) {
+                getApiService().startEvClimate(
+                    accessToken = token,
+                    username = username,
+                    vin = vin,
+                    appCloudVin = vin,
+                    servicePin = pin,
+                    registrationId = registrationId,
+                    gen = generation,
+                    brandIndicator = brandIndicator,
+                    request = request
+                )
+            } else {
+                getApiService().startEngine(
+                    accessToken = token,
+                    username = username,
+                    vin = vin,
+                    appCloudVin = vin,
+                    servicePin = pin,
+                    registrationId = registrationId,
+                    gen = generation,
+                    brandIndicator = brandIndicator,
+                    request = request
+                )
+            }
+            validateRawCommandResponse(response, "Start")
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Network error")
+        }
+    }
+
+    suspend fun stopEngine(
+        vin: String,
+        registrationId: String = "",
+        generation: String = "3",
+        brandIndicator: String = "H"
+    ): Result<Unit> {
+        if (preferencesManager.isDemoMode()) {
+            demoVehicleStore.stopClimate(vin)
+            return Result.Success(Unit)
+        }
+        if (isKiaUsRegion()) {
+            return runKiaUsCommand(vin, registrationId, "Stop") { sid, vehicleKey ->
+                getKiaUsApiService().stopClimate(sid, vehicleKey)
+            }
+        }
+        if (isCanadaRegion()) {
+            return runCanadaPinCommand(vin, registrationId, "Stop") { accessToken, vehicleId, pAuth, deviceId, pin ->
+                getCanadaApiService().stopEngine(accessToken, vehicleId, pAuth, deviceId, mapOf("pin" to pin))
+            }
+        }
+        if (isEuropeRegion()) {
+            return runEuropeCommand(vin, registrationId, "Stop") { authorization, vehicleId ->
+                val deviceId = registeredEuropeDeviceId()
+                getEuApiService().controlEngine(authorization, vehicleId, JsonObject().apply {
+                    addProperty("action", "stop")
+                    addProperty("deviceId", deviceId)
+                })
+            }
+        }
+        if (isAustraliaRegion()) {
+            return runAustraliaCommand(vin, registrationId, "Stop") { authorization, vehicleId ->
+                getAuApiService().controlEngine(authorization, vehicleId, JsonObject().apply {
+                    addProperty("action", "stop")
+                    addProperty("deviceId", australiaDeviceId())
+                })
+            }
+        }
+        return try {
+            val token = getToken()
+            val username = getUsername()
+            val pin = getServicePin()
+            val response = getApiService().stopEngine(
+                accessToken = token,
+                username = username,
+                vin = vin,
+                appCloudVin = vin,
+                servicePin = pin,
+                registrationId = registrationId,
+                gen = generation,
+                brandIndicator = brandIndicator
+            )
+            validateRawCommandResponse(response, "Stop")
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Network error")
+        }
+    }
+
+
+    private suspend fun stopEvClimate(
+        vin: String,
+        registrationId: String = "",
+        generation: String = "3",
+        brandIndicator: String = "H"
+    ): Result<Unit> {
+        if (preferencesManager.isDemoMode()) {
+            demoVehicleStore.stopClimate(vin)
+            return Result.Success(Unit)
+        }
+        if (isKiaUsRegion()) {
+            return runKiaUsCommand(vin, registrationId, "Stop Climate") { sid, vehicleKey ->
+                getKiaUsApiService().stopClimate(sid, vehicleKey)
+            }
+        }
+        if (isCanadaRegion()) {
+            return try {
+                val vehicleId = registrationId.ifBlank { vin }
+                val remaining = canadaCooldownRemainingMs(vehicleId)
+                if (remaining > 0L) {
+                    return Result.Error(canadaCooldownMessage(remaining))
+                }
+                when (
+                    val result = runCanadaPinCommand(vin, registrationId, "Stop Climate") { accessToken, id, pAuth, deviceId, pin ->
+                        getCanadaApiService().stopEvClimate(accessToken, id, pAuth, deviceId, mapOf("pin" to pin))
+                    }
+                ) {
+                    is Result.Success -> {
+                        rememberCanadaCommandCooldown(vehicleId)
+                        result
+                    }
+                    is Result.Error -> {
+                        if (result.message.contains("90 seconds", ignoreCase = true) ||
+                            result.message.contains("6533") ||
+                            result.message.contains("earlier inquiry", ignoreCase = true) ||
+                            result.message.contains("earlier request", ignoreCase = true)
+                        ) {
+                            rememberCanadaCommandCooldown(vehicleId)
+                        }
+                        result
+                    }
+                    else -> result
+                }
+            } catch (e: Exception) {
+                Result.Error(e.message ?: "Stop Climate failed")
+            }
+        }
+        if (isEuropeRegion()) {
+            return runEuropeCommand(vin, registrationId, "Stop Climate") { authorization, vehicleId ->
+                val deviceId = registeredEuropeDeviceId()
+                getEuApiService().controlEvClimate(authorization, vehicleId, JsonObject().apply {
+                    addProperty("action", "stop")
+                    addProperty("deviceId", deviceId)
+                })
+            }
+        }
+        if (isAustraliaRegion()) {
+            return runAustraliaCommand(vin, registrationId, "Stop Climate") { authorization, vehicleId ->
+                getAuApiService().controlEvClimate(authorization, vehicleId, JsonObject().apply {
+                    addProperty("action", "stop")
+                    addProperty("deviceId", australiaDeviceId())
+                })
+            }
+        }
+        return try {
+            val token = getToken()
+            val username = getUsername()
+            val pin = getServicePin()
+            val response = getApiService().stopEvClimate(
+                accessToken = token,
+                username = username,
+                vin = vin,
+                appCloudVin = vin,
+                servicePin = pin,
+                registrationId = registrationId,
+                gen = generation,
+                brandIndicator = brandIndicator
+            )
+            validateRawCommandResponse(response, "Stop Climate")
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Network error")
+        }
+    }
+
+    // ─── Climate ───────────────────────────────────────────────────────────────
+
+    suspend fun startClimate(
+        vin: String,
+        tempF: String = "72",
+        defrost: Boolean = false,
+        driverSeatHeat: Int = 2,
+        passengerSeatHeat: Int = 2,
+        rearLeftSeatHeat: Int = 2,
+        rearRightSeatHeat: Int = 2,
+        heatedSteering: Boolean = false,
+        durationMinutes: Int = 10,
+        isEv: Boolean = false,
+        registrationId: String = "",
+        generation: String = "3",
+        brandIndicator: String = "H"
+    ): Result<Unit> {
+        // Hyundai USA uses remote-start/preconditioning for cabin climate.
+        // EVs go through /ac/v2/evc/fatc/start; gas vehicles through /ac/v2/rcs/rsc/start.
+        // Seat heat/vent values use Hyundai's reported level codes:
+        // 2/off, 6-8 heat low/medium/high, 3-5 vent low/medium/high.
+        return startEngine(
+            vin = vin,
+            tempF = tempF,
+            hvacOn = true,
+            defrost = defrost,
+            driverSeatHeat = driverSeatHeat,
+            passengerSeatHeat = passengerSeatHeat,
+            rearLeftSeatHeat = rearLeftSeatHeat,
+            rearRightSeatHeat = rearRightSeatHeat,
+            heatedSteering = heatedSteering,
+            durationMinutes = durationMinutes,
+            isEv = isEv,
+            registrationId = registrationId,
+            generation = generation,
+            brandIndicator = brandIndicator
+        )
+    }
+
+    suspend fun stopClimate(
+        vin: String,
+        isEv: Boolean = false,
+        registrationId: String = "",
+        generation: String = "3",
+        brandIndicator: String = "H"
+    ): Result<Unit> {
+        // IONIQ EV climate preconditioning should stop through the EV FATC route.
+        // The non-EV rsc/stop route returns unsupported for the IONIQ 9.
+        return if (isEv) {
+            stopEvClimate(
+                vin = vin,
+                registrationId = registrationId,
+                generation = generation,
+                brandIndicator = brandIndicator
+            )
+        } else {
+            stopEngine(
+                vin = vin,
+                registrationId = registrationId,
+                generation = generation,
+                brandIndicator = brandIndicator
+            )
+        }
+    }
+
+    // ─── EV Charging ───────────────────────────────────────────────────────────
+
+    suspend fun startCharging(
+        vin: String,
+        registrationId: String = "",
+        generation: String = "3",
+        brandIndicator: String = "H",
+        vehicleId: String = ""
+    ): Result<Unit> {
+        if (preferencesManager.isDemoMode()) {
+            demoVehicleStore.startCharging(vin)
+            return Result.Success(Unit)
+        }
+        if (isKiaUsRegion()) {
+            return runKiaUsCommand(vin, registrationId.ifBlank { vehicleId }, "Charge start") { sid, kiaVehicleKey ->
+                getKiaUsApiService().startCharging(
+                    sid = sid,
+                    vehicleKey = kiaVehicleKey,
+                    body = JsonObject().apply { addProperty("chargeRatio", 100) }
+                )
+            }
+        }
+        if (isCanadaRegion()) {
+            return runCanadaPinCommand(vin, registrationId.ifBlank { vehicleId }, "Charge start") { accessToken, caVehicleId, pAuth, deviceId, pin ->
+                getCanadaApiService().startCharging(accessToken, caVehicleId, pAuth, deviceId, mapOf("pin" to pin))
+            }
+        }
+        if (isEuropeRegion()) {
+            return runEuropeCommand(vin, registrationId.ifBlank { vehicleId }, "Charge start") { authorization, euVehicleId ->
+                val deviceId = registeredEuropeDeviceId()
+                getEuApiService().controlCharge(authorization, euVehicleId, JsonObject().apply {
+                    addProperty("action", "start")
+                    addProperty("deviceId", deviceId)
+                })
+            }
+        }
+        if (isAustraliaRegion()) {
+            return runAustraliaCommand(vin, registrationId.ifBlank { vehicleId }, "Charge start") { authorization, auVehicleId ->
+                getAuApiService().controlCharge(authorization, auVehicleId, JsonObject().apply {
+                    addProperty("action", "start")
+                    addProperty("deviceId", australiaDeviceId())
+                })
+            }
+        }
+        return try {
+            val token = getToken()
+            val username = getUsername()
+            val pin = getServicePin()
+
+            val response = getApiService().startCharging(
+                accessToken = token,
+                username = username,
+                vin = vin,
+                appCloudVin = vin,
+                servicePin = pin,
+                registrationId = registrationId,
+                gen = generation,
+                brandIndicator = brandIndicator,
+                request = EVChargeRequest(userName = username, vin = vin, action = "start")
+            )
+            validateEmptyCommandResponse(response, "Charge start")
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Network error")
+        }
+    }
+
+    suspend fun stopCharging(
+        vin: String,
+        registrationId: String = "",
+        generation: String = "3",
+        brandIndicator: String = "H",
+        vehicleId: String = ""
+    ): Result<Unit> {
+        if (preferencesManager.isDemoMode()) {
+            demoVehicleStore.stopCharging(vin)
+            return Result.Success(Unit)
+        }
+        if (isKiaUsRegion()) {
+            return runKiaUsCommand(vin, registrationId.ifBlank { vehicleId }, "Charge stop") { sid, kiaVehicleKey ->
+                getKiaUsApiService().stopCharging(sid, kiaVehicleKey)
+            }
+        }
+        if (isCanadaRegion()) {
+            return runCanadaPinCommand(vin, registrationId.ifBlank { vehicleId }, "Charge stop") { accessToken, caVehicleId, pAuth, deviceId, pin ->
+                getCanadaApiService().stopCharging(accessToken, caVehicleId, pAuth, deviceId, mapOf("pin" to pin))
+            }
+        }
+        if (isEuropeRegion()) {
+            return runEuropeCommand(vin, registrationId.ifBlank { vehicleId }, "Charge stop") { authorization, euVehicleId ->
+                val deviceId = registeredEuropeDeviceId()
+                getEuApiService().controlCharge(authorization, euVehicleId, JsonObject().apply {
+                    addProperty("action", "stop")
+                    addProperty("deviceId", deviceId)
+                })
+            }
+        }
+        if (isAustraliaRegion()) {
+            return runAustraliaCommand(vin, registrationId.ifBlank { vehicleId }, "Charge stop") { authorization, auVehicleId ->
+                getAuApiService().controlCharge(authorization, auVehicleId, JsonObject().apply {
+                    addProperty("action", "stop")
+                    addProperty("deviceId", australiaDeviceId())
+                })
+            }
+        }
+        return try {
+            val token = getToken()
+            val username = getUsername()
+            val pin = getServicePin()
+
+            val response = getApiService().stopCharging(
+                accessToken = token,
+                username = username,
+                vin = vin,
+                appCloudVin = vin,
+                servicePin = pin,
+                registrationId = registrationId,
+                gen = generation,
+                brandIndicator = brandIndicator,
+                request = EVChargeRequest(userName = username, vin = vin, action = "stop")
+            )
+            validateEmptyCommandResponse(response, "Charge stop")
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Network error")
+        }
+    }
+
+
+    private fun normalizeScheduleTime(raw: String): String {
+        val digits = raw.filter { it.isDigit() }
+        val padded = when {
+            digits.length >= 4 -> digits.takeLast(4)
+            digits.length == 3 -> digits.padStart(4, '0')
+            else -> "0000"
+        }
+        val hour = padded.take(2).toIntOrNull() ?: 0
+        val minute = padded.takeLast(2).toIntOrNull() ?: 0
+        if (hour !in 0..23 || minute !in 0..59) return "0000"
+        return "%02d%02d".format(java.util.Locale.US, hour, minute)
+    }
+
+    private fun scheduleTimeJson(hhmm: String): JsonObject {
+        val normalized = normalizeScheduleTime(hhmm)
+        return JsonObject().apply {
+            addProperty("time", normalized)
+            addProperty("timeSection", if ((normalized.take(2).toIntOrNull() ?: 0) >= 12) 1 else 0)
+        }
+    }
+
+    private fun scheduleEndpointJson(hhmm: String, day: Int = 0): JsonObject = JsonObject().apply {
+        add("time", scheduleTimeJson(hhmm))
+        addProperty("day", day)
+    }
+
+    private fun offPeakTimeJson(start: String, end: String, lowercaseKeys: Boolean): JsonObject = JsonObject().apply {
+        val startKey = if (lowercaseKeys) "starttime" else "startTime"
+        val endKey = if (lowercaseKeys) "endtime" else "endTime"
+        add(startKey, scheduleTimeJson(start))
+        add(endKey, scheduleTimeJson(end))
+    }
+
+    private fun numericWeekDaysJson(): JsonArray = JsonArray().apply {
+        (0..6).forEach { add(it) }
+    }
+
+    private fun reservationDetailJson(chargeTime: String, enabled: Boolean = true): JsonObject = JsonObject().apply {
+        add("reservChargeInfoDetail", JsonObject().apply {
+            addProperty("reservChargeSet", enabled)
+            add("reservFatcSet", JsonObject().apply {
+                addProperty("airCtrl", 0)
+                add("airTemp", JsonObject().apply {
+                    addProperty("value", "OFF")
+                    addProperty("unit", 0)
+                })
+                addProperty("defrost", false)
+            })
+            add("reservInfo", JsonObject().apply {
+                add("day", numericWeekDaysJson())
+                add("time", scheduleTimeJson(chargeTime))
+            })
+        })
+    }
+
+    private fun buildChargeSchedulePayload(
+        chargeStartTime: String,
+        chargeEndTime: String,
+        offPeakStartTime: String,
+        offPeakEndTime: String,
+        offPeakOnly: Boolean,
+        includeExtendedWindowFields: Boolean = false,
+        europeanPayload: Boolean = false
+    ): JsonObject {
+        val chargeStart = normalizeScheduleTime(chargeStartTime)
+        val chargeEnd = normalizeScheduleTime(chargeEndTime)
+        val offPeakStart = normalizeScheduleTime(offPeakStartTime)
+        val offPeakEnd = normalizeScheduleTime(offPeakEndTime)
+        val days = JsonArray().apply {
+            listOf("SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY").forEach { add(it) }
+        }
+        if (!europeanPayload) {
+            // Keep North America close to observed MyHyundai traffic. The NA endpoint appears
+            // to accept exactly one charge start time plus optional off-peak settings; sending
+            // synthetic ect/reservation detail objects can return 200/empty but not change the car.
+            return JsonObject().apply {
+                addProperty("airCtrl", 0)
+                addProperty("chargeSet", true)
+                addProperty("defrost", false)
+                add("offpeakPowerInfo", JsonObject().apply {
+                    if (offPeakOnly) {
+                        addProperty("offPeakPowerFlag", 1)
+                        add("offPeakPowerTime1", offPeakTimeJson(offPeakStart, offPeakEnd, lowercaseKeys = false))
+                    } else {
+                        addProperty("offPeakPowerFlag", 0)
+                        add("offPeakPowerTime1", JsonObject())
+                    }
+                    add("offPeakPowerTime2", JsonObject())
+                })
+                add("day", days)
+                addProperty("alarmTime", 0)
+                add("airTemp", JsonObject().apply {
+                    addProperty("value", "72")
+                    addProperty("unit", 1)
+                })
+                addProperty("reservFlag", 1)
+                addProperty("startTime", chargeStart)
+            }
+        }
+        return JsonObject().apply {
+            addProperty("airCtrl", 0)
+            addProperty("chargeSet", true)
+            addProperty("defrost", false)
+            add("day", days)
+            addProperty("alarmTime", 0)
+            add("airTemp", JsonObject().apply {
+                addProperty("value", "72")
+                addProperty("unit", 1)
+            })
+            addProperty("reservFlag", 1)
+            addProperty("startTime", chargeStart)
+            // The status API reports the editable charge window as reservChargeInfos.ect.
+            // Send it back even for NA so the UI's charge start/end fields can round-trip.
+            add("ect", JsonObject().apply {
+                add("start", scheduleEndpointJson(chargeStart, 7))
+                add("end", scheduleEndpointJson(chargeEnd, 7))
+            })
+            if (includeExtendedWindowFields) {
+                addProperty("endTime", chargeEnd)
+            }
+            add("offpeakPowerInfo", JsonObject().apply {
+                // Hyundai/Kia uses 1 = off-peak only, 2 = prefer/prioritize off-peak.
+                // Sending 0 disables/clears off-peak on some backends, which makes the
+                // command look accepted while nothing useful changes.
+                addProperty("offPeakPowerFlag", if (offPeakOnly) 1 else 2)
+                add("offPeakPowerTime1", offPeakTimeJson(offPeakStart, offPeakEnd, lowercaseKeys = true))
+                add("offPeakPowerTime2", JsonObject())
+            })
+            add("reservChargeInfo", reservationDetailJson(chargeStart, enabled = true))
+            add("reserveChargeInfo2", reservationDetailJson(chargeEnd, enabled = false))
+        }
+    }
+
+    suspend fun setChargingSchedule(
+        vin: String,
+        chargeStartTime: String,
+        chargeEndTime: String,
+        offPeakStartTime: String,
+        offPeakEndTime: String,
+        offPeakOnly: Boolean,
+        registrationId: String = "",
+        generation: String = "3",
+        brandIndicator: String = "H",
+        vehicleId: String = ""
+    ): Result<Unit> {
+        if (preferencesManager.isDemoMode()) {
+            demoVehicleStore.setChargingSchedule(
+                vin = vin,
+                chargeStartTime = chargeStartTime,
+                chargeEndTime = chargeEndTime,
+                offPeakStartTime = offPeakStartTime,
+                offPeakEndTime = offPeakEndTime,
+                offPeakOnly = offPeakOnly
+            )
+            return Result.Success(Unit)
+        }
+        if (isKiaUsRegion()) return Result.Error("USA Kia charging schedule setting is not mapped yet; start/stop charging and charge target setting are available.")
+        if (isCanadaRegion()) return Result.Error("Canadian charging schedule setting is not mapped yet.")
+        if (isAustraliaRegion()) return Result.Error("Australia/NZ charging schedule setting is not mapped yet.")
+        if (isEuropeRegion()) {
+            val payload = buildChargeSchedulePayload(
+                chargeStartTime = chargeStartTime,
+                chargeEndTime = chargeEndTime,
+                offPeakStartTime = offPeakStartTime,
+                offPeakEndTime = offPeakEndTime,
+                offPeakOnly = offPeakOnly,
+                includeExtendedWindowFields = true,
+                europeanPayload = true
+            )
+            return runEuropeCommand(vin, registrationId.ifBlank { vehicleId }, "Set charging schedule") { authorization, euVehicleId ->
+                val primary = getEuApiService().setChargeSchedule(authorization, euVehicleId, payload)
+                if (primary.isSuccessful || primary.code() !in setOf(404, 405)) {
+                    primary
+                } else {
+                    getEuApiService().setChargeScheduleAlt(authorization, euVehicleId, payload)
+                }
+            }
+        }
+
+        val payload = buildChargeSchedulePayload(
+            chargeStartTime = chargeStartTime,
+            chargeEndTime = chargeEndTime,
+            offPeakStartTime = offPeakStartTime,
+            offPeakEndTime = offPeakEndTime,
+            offPeakOnly = offPeakOnly,
+            includeExtendedWindowFields = false,
+            europeanPayload = false
+        )
+
+        return try {
+            val token = getToken()
+            val username = getUsername()
+            val pin = getServicePin()
+            val response = getApiService().setChargeSchedule(
+                accessToken = token,
+                username = username,
+                vin = vin,
+                appCloudVin = vin,
+                servicePin = pin,
+                registrationId = registrationId,
+                gen = generation,
+                brandIndicator = brandIndicator,
+                request = payload
+            )
+            validateRawCommandResponse(response, "Set charging schedule")
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Network error")
+        }
+    }
+
+    suspend fun setChargeTarget(
+        vin: String,
+        acTarget: Int = 90,
+        dcTarget: Int = 80,
+        registrationId: String = "",
+        generation: String = "3",
+        brandIndicator: String = "H"
+    ): Result<Unit> {
+        if (preferencesManager.isDemoMode()) {
+            val allowedTargets = setOf(50, 60, 70, 80, 90, 100)
+            if (acTarget !in allowedTargets || dcTarget !in allowedTargets) {
+                return Result.Error("Charge targets must be one of 50, 60, 70, 80, 90, or 100%")
+            }
+            demoVehicleStore.setChargeTargets(vin, acTarget, dcTarget)
+            return Result.Success(Unit)
+        }
+        if (isKiaUsRegion()) {
+            val allowedTargets = setOf(50, 60, 70, 80, 90, 100)
+            if (acTarget !in allowedTargets || dcTarget !in allowedTargets) {
+                return Result.Error("Charge targets must be one of 50, 60, 70, 80, 90, or 100%")
+            }
+            return runKiaUsCommand(vin, registrationId, "Set charge targets") { sid, vehicleKey ->
+                getKiaUsApiService().setChargeTargets(
+                    sid = sid,
+                    vehicleKey = vehicleKey,
+                    body = JsonObject().apply {
+                        add("targetSOClist", JsonArray().apply {
+                            add(JsonObject().apply {
+                                addProperty("plugType", 0)
+                                addProperty("targetSOClevel", dcTarget)
+                            })
+                            add(JsonObject().apply {
+                                addProperty("plugType", 1)
+                                addProperty("targetSOClevel", acTarget)
+                            })
+                        })
+                    }
+                )
+            }
+        }
+        if (isCanadaRegion()) return Result.Error("Canadian charge target setting is not mapped yet; start/stop charging is available for this vehicle.")
+        if (isEuropeRegion()) return Result.Error("European charge target setting is not mapped yet; start/stop charging is available for this vehicle.")
+        if (isAustraliaRegion()) return Result.Error("Australia/NZ charge target setting is not mapped yet; start/stop charging is available for this vehicle.")
+        val allowedTargets = setOf(50, 60, 70, 80, 90, 100)
+        if (acTarget !in allowedTargets || dcTarget !in allowedTargets) {
+            return Result.Error("Charge targets must be one of 50, 60, 70, 80, 90, or 100%")
+        }
+
+        return try {
+            val token = getToken()
+            val username = getUsername()
+            val pin = getServicePin()
+
+            // Bluelinky maps EV charge target modes as FAST = 0 and SLOW = 1.
+            // On the observed US IONIQ 9 status payload, plugType 0 corresponds to DC
+            // and plugType 1 corresponds to AC.
+            val request = SpaChargeTargetRequest(
+                targets = listOf(
+                    ChargeTarget(plugType = 0, targetSoc = dcTarget),
+                    ChargeTarget(plugType = 1, targetSoc = acTarget)
+                )
+            )
+
+            val response = getApiService().setSpaChargeTargets(
+                accessToken = token,
+                username = username,
+                vin = vin,
+                appCloudVin = vin,
+                servicePin = pin,
+                registrationId = registrationId,
+                gen = generation,
+                brandIndicator = brandIndicator,
+                request = request
+            )
+
+            validateCommandResponse(response, "Set charge targets")
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Network error")
+        }
+    }
+
+
+    // ─── Horn / Lights ─────────────────────────────────────────────────────────
+
+    suspend fun hornAndLights(
+        vin: String,
+        registrationId: String = "",
+        generation: String = "3",
+        brandIndicator: String = "H"
+    ): Result<Unit> {
+        if (preferencesManager.isDemoMode()) {
+            demoVehicleStore.hornAndLights(vin)
+            return Result.Success(Unit)
+        }
+        if (isKiaUsRegion()) return Result.Error("Horn/lights for USA Kia is not mapped yet.")
+        if (isCanadaRegion()) return Result.Error("Horn/lights for Canada is not mapped yet.")
+        if (isEuropeRegion()) return Result.Error("Horn/lights for Europe is not mapped yet.")
+        if (isAustraliaRegion()) return Result.Error("Horn/lights for Australia/NZ is not mapped yet.")
+        return try {
+            val token = getToken()
+            val username = getUsername()
+            val pin = getServicePin()
+            val response = getApiService().hornAndLights(
+                accessToken = token,
+                username = username,
+                vin = vin,
+                appCloudVin = vin,
+                servicePin = pin,
+                registrationId = registrationId,
+                gen = generation,
+                brandIndicator = brandIndicator,
+                formUserName = username,
+                formVin = vin
+            )
+            validateCommandResponse(response, "Horn/lights")
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Network error")
+        }
+    }
+
+    suspend fun flashLights(
+        vin: String,
+        registrationId: String = "",
+        generation: String = "3",
+        brandIndicator: String = "H"
+    ): Result<Unit> {
+        if (preferencesManager.isDemoMode()) {
+            demoVehicleStore.flashLights(vin)
+            return Result.Success(Unit)
+        }
+        if (isKiaUsRegion()) return Result.Error("Flash lights for USA Kia is not mapped yet.")
+        if (isCanadaRegion()) return Result.Error("Flash lights for Canada is not mapped yet.")
+        if (isEuropeRegion()) return Result.Error("Flash lights for Europe is not mapped yet.")
+        if (isAustraliaRegion()) return Result.Error("Flash lights for Australia/NZ is not mapped yet.")
+        return try {
+            val token = getToken()
+            val username = getUsername()
+            val pin = getServicePin()
+            val response = getApiService().flashLightsOnly(
+                accessToken = token,
+                username = username,
+                vin = vin,
+                appCloudVin = vin,
+                servicePin = pin,
+                registrationId = registrationId,
+                gen = generation,
+                brandIndicator = brandIndicator,
+                formUserName = username,
+                formVin = vin
+            )
+            validateCommandResponse(response, "Flash lights")
+        } catch (e: Exception) {
+            Result.Error(e.message ?: "Network error")
+        }
+    }
+
+    // ─── Official-app-style feature hooks ─────────────────────────────────────
+
+    fun setValetMode(vin: String, enabled: Boolean): Result<Unit> {
+        val requestedState = if (enabled) "enable" else "disable"
+        val vehicleSuffix = vin.takeLast(6).takeIf { it.isNotBlank() }?.let { " for vehicle ending in $it" }.orEmpty()
+        return Result.Error(
+            "Valet Mode $requestedState$vehicleSuffix is saved locally, but the Hyundai valet endpoint is not mapped in this project yet."
+        )
+    }
+
+    fun getSurroundViewSnapshot(vin: String): Result<SurroundViewSnapshot> {
+        val vehicleSuffix = vin.takeLast(6).takeIf { it.isNotBlank() }?.let { " for vehicle ending in $it" }.orEmpty()
+        return Result.Error(
+            "Surround View Monitor$vehicleSuffix requires Hyundai camera snapshot endpoints that are not mapped in this project yet."
+        )
+    }
+
+}
